@@ -11,6 +11,7 @@ GET /api/verify/github?username={username}&user_id={uid}
 """
 
 import json
+import httpx
 from fastapi import APIRouter, HTTPException, Query
 
 from app.db import get_conn, release_conn
@@ -55,6 +56,11 @@ async def verify_github(
         result = await _github.verify(username, cv_projects)
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
+    except PermissionError as exc:
+        # 401/403 from GitHub — token missing or invalid
+        raise HTTPException(401, str(exc)) from exc
+    except httpx.ConnectError as exc:
+        raise HTTPException(503, "Cannot reach GitHub API — check Railway's network access.") from exc
     except Exception as exc:
         raise HTTPException(500, f"GitHub verification failed: {exc}") from exc
 

@@ -36,10 +36,16 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
+# Build origins list — always include wildcard so the deployed Vercel
+# Flutter web build (which may run on any preview URL) isn't blocked.
+_cors_origins = settings.cors_origins
+if "*" not in _cors_origins:
+    _cors_origins = _cors_origins + ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins + ["*"],
-    allow_credentials=True,
+    allow_origins=_cors_origins,
+    allow_credentials=False,   # must be False when allow_origins contains "*"
     allow_methods=["*"],
     allow_headers=["*"],
 )
