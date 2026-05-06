@@ -36,18 +36,20 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Build origins list — always include wildcard so the deployed Vercel
-# Flutter web build (which may run on any preview URL) isn't blocked.
-_cors_origins = settings.cors_origins
-if "*" not in _cors_origins:
-    _cors_origins = _cors_origins + ["*"]
-
+# allow_origins=["*"] is the only safe default for a public API that serves
+# a Flutter Web build from Vercel (which can have many preview subdomains).
+# When allow_origins=["*"], allow_credentials MUST be False — browser rejects
+# credentialed requests to wildcard origins.
+# We explicitly list every header Flutter Web sends so the OPTIONS preflight
+# for multipart/form-data (CV upload) always succeeds.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=False,   # must be False when allow_origins contains "*"
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
+    expose_headers=["Content-Type", "X-Request-ID"],
+    max_age=600,
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
@@ -60,3 +62,9 @@ app.include_router(badges.router, prefix="/api/badges", tags=["Badges"])
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict:
     return {"status": "ok", "service": "auctor-api"}
+
+
+@app.options("/{rest_of_path:path}", include_in_schema=False)
+async def preflight_handler(rest_of_path: str) -> dict:
+    """Catch-all OPTIONS handler so every endpoint responds 200 to preflight."""
+    return {}
