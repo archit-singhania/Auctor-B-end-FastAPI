@@ -7,14 +7,6 @@ Two-step process:
   1. Text extraction  — pdfminer.six pulls plain text from the PDF
   2. Structured parse — OpenAI GPT-4o parses skills/projects/experience
                         (falls back to regex heuristics if API key is absent)
-
-Why pdfminer over PyMuPDF?
-  Pure-Python, no native binary required → easier to deploy in containers.
-  PyMuPDF is faster but needs a compiled libmupdf.
-
-Why OpenAI for parsing?
-  Resumes have wildly different layouts. An LLM handles all formats
-  (European CVs, Indian formats, LinkedIn exports, etc.) without custom rules.
 """
 
 import io
@@ -40,12 +32,21 @@ class CvParserService:
         """Main entry point. Accepts raw PDF bytes, returns ExtractedCvData."""
         raw_text = self._extract_text(pdf_bytes)
 
-        if settings.openai_api_key:
+        if not raw_text or not raw_text.strip():
+            raise ValueError(
+                "Could not extract text from PDF. "
+                "The file may be scanned/image-only or password-protected."
+            )
+
+        logger.info("Extracted %d chars from PDF", len(raw_text))
+
+        if settings.openai_api_key and settings.openai_api_key.strip():
             try:
                 return await self._llm_parse(raw_text)
             except Exception as exc:
                 logger.warning("LLM parse failed, falling back to heuristic: %s", exc)
 
+        logger.info("Using heuristic CV parser (no OpenAI key configured)")
         return self._heuristic_parse(raw_text)
 
     # ── Text Extraction ───────────────────────────────────────────────────────
@@ -53,21 +54,24 @@ class CvParserService:
     def _extract_text(self, pdf_bytes: bytes) -> str:
         """Use pdfminer to extract plain text from a PDF byte string."""
         output = io.StringIO()
-        with io.BytesIO(pdf_bytes) as pdf_file:
-            extract_text_to_fp(
-                pdf_file,
-                output,
-                laparams=LAParams(),
-                output_type="text",
-                codec="utf-8",
-            )
+        try:
+            with io.BytesIO(pdf_bytes) as pdf_file:
+                extract_text_to_fp(
+                    pdf_file,
+                    output,
+                    laparams=LAParams(),
+                    output_type="text",
+                    codec="utf-8",
+                )
+        except Exception as exc:
+            logger.error("pdfminer extraction failed: %s", exc)
+            raise ValueError(f"PDF text extraction failed: {exc}") from exc
         return output.getvalue()
 
     # ── LLM Parse (OpenAI) ────────────────────────────────────────────────────
 
     async def _llm_parse(self, raw_text: str) -> ExtractedCvData:
         """Send resume text to OpenAI and ask for structured JSON output."""
-        # Import here so the service works without openai installed if no key
         from openai import AsyncOpenAI
 
         client = AsyncOpenAI(api_key=settings.openai_api_key)
@@ -114,7 +118,6 @@ Resume text:
         )
 
         raw_json = response.choices[0].message.content or "{}"
-        # Strip any accidental markdown fences
         raw_json = re.sub(r"```json|```", "", raw_json).strip()
 
         data = json.loads(raw_json)
@@ -122,19 +125,21 @@ Resume text:
             skills=data.get("skills", []),
             projects=[
                 Project(
-                    name=p.get("name", ""),
+                    name=p.get("name", "Unnamed Project"),
                     description=p.get("description", ""),
                     tech_stack=p.get("tech_stack", []),
                 )
                 for p in data.get("projects", [])
+                if p.get("name")
             ],
             experience=[
                 Experience(
-                    company=e.get("company", ""),
-                    role=e.get("role", ""),
+                    company=e.get("company", "Unknown"),
+                    role=e.get("role", "Unknown"),
                     duration=e.get("duration", ""),
                 )
                 for e in data.get("experience", [])
+                if e.get("company") and e.get("role")
             ],
         )
 
@@ -148,6 +153,12 @@ Resume text:
         skills = self._extract_skills_heuristic(raw_text)
         projects = self._extract_projects_heuristic(raw_text)
         experience = self._extract_experience_heuristic(raw_text)
+
+        # Ensure we always return something useful even with a sparse CV
+        if not skills:
+            logger.warning("Heuristic found no skills — returning defaults")
+            skills = ["See CV for details"]
+
         return ExtractedCvData(skills=skills, projects=projects, experience=experience)
 
     # Common tech keywords to detect as skills
@@ -157,7 +168,12 @@ Resume text:
         "Django", "Flask", "Spring", "Docker", "Kubernetes", "AWS", "GCP",
         "Azure", "PostgreSQL", "MySQL", "MongoDB", "Redis", "GraphQL",
         "REST", "JWT", "OAuth", "Git", "Linux", "CI/CD", "Terraform",
-        "Microservices", "gRPC", "Kafka", "RabbitMQ",
+        "Microservices", "gRPC", "Kafka", "RabbitMQ", "C++", "C#", "Go",
+        "Rust", "Ruby", "PHP", "HTML", "CSS", "Sass", "Tailwind",
+        "TensorFlow", "PyTorch", "Pandas", "NumPy", "Scikit-learn",
+        "Firebase", "Supabase", "Prisma", "Next.js", "Nuxt", "Express",
+        "Nest.js", "Spring Boot", "Hibernate", "Maven", "Gradle",
+        "Jenkins", "GitHub Actions", "CircleCI", "Ansible", "Nginx",
     ]
 
     def _extract_skills_heuristic(self, text: str) -> list[str]:
@@ -174,13 +190,12 @@ Resume text:
         if not section:
             return projects
 
-        # Each project starts at a line that doesn't begin with whitespace
         for line in section.splitlines():
             line = line.strip()
-            if len(line) > 5 and not line.lower().startswith(("•", "-", "*")):
+            if len(line) > 5 and not line.lower().startswith(("•", "-", "*", "·")):
                 projects.append(
                     Project(
-                        name=line[:60],
+                        name=line[:80],
                         description="",
                         tech_stack=[],
                     )
@@ -197,7 +212,6 @@ Resume text:
         if not section:
             return experiences
 
-        # Simple pattern: "Role at Company · Duration"
         pattern = re.compile(
             r"(.+?)\s+(?:at|@)\s+(.+?)[\s·|,]+(\w{3}\s+\d{4}.*)",
             re.IGNORECASE,

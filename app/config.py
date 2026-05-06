@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     # ── GitHub ─────────────────────────────────────────────
     github_token: str = ""
 
+    # ── Score weights (must sum to 1.0) ─────────────────────────────────
+    weight_github:     float = 0.25
+    weight_leetcode:   float = 0.15
+    weight_badges:     float = 0.30
+    weight_projects:   float = 0.15
+    weight_experience: float = 0.15
+
     # ── CORS ───────────────────────────────────────────────
     allowed_origins: str = "*"
 
