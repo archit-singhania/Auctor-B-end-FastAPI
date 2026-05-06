@@ -11,11 +11,11 @@ Run:
   uvicorn app.main:app --reload --port 8000
 """
 
+import re
 from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.config import settings
 from app.db import create_pool, close_pool
 from app.routers import cv, verify, score, badges
 
@@ -35,30 +35,48 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ── CORS ──────────────────────────────────────────────────────────────────────
-# Explicitly list all allowed origins so the browser never gets a mismatch.
-# Wildcard "*" can cause issues with some browser XHR implementations.
-# Add new Vercel preview URLs here if needed.
-ALLOWED_ORIGINS = [
-    "https://auctor-flutter-init.vercel.app",   # production Vercel
-    "https://auctor-f-end-flutter.vercel.app",  # alternate Vercel URL
-    "http://localhost:3000",                     # local web dev
-    "http://localhost:8080",
-    "http://localhost:5000",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:8080",
-]
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://auctor.*\.vercel\.app",  # all Vercel preview deployments
-    allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["*"],
-    expose_headers=["Content-Type", "X-Request-ID"],
-    max_age=86400,
-)
+# ── Custom CORS middleware (replaces CORSMiddleware entirely) ─────────────────
+# CORSMiddleware has edge cases with multipart preflight + wildcard origins.
+# This custom middleware is explicit and handles every case correctly.
+class PermissiveCORSMiddleware(BaseHTTPMiddleware):
+    # Regex: allow any Vercel preview + localhost for dev
+    _ORIGIN_RE = re.compile(
+        r"^https://[\w-]+\.vercel\.app$"
+        r"|^http://localhost(:\d+)?$"
+        r"|^http://127\.0\.0\.1(:\d+)?$"
+    )
+
+    CORS_HEADERS = {
+        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+        "Access-Control-Allow-Headers": "*",
+        "Access-Control-Expose-Headers": "Content-Type, X-Request-ID",
+        "Access-Control-Max-Age": "86400",
+    }
+
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin", "")
+
+        # Decide which origin to echo back
+        if self._ORIGIN_RE.match(origin):
+            allow_origin = origin   # echo the exact origin back
+        else:
+            allow_origin = "*"      # non-browser or unknown origin — use wildcard
+
+        # Short-circuit OPTIONS (preflight) — never forward to app
+        if request.method == "OPTIONS":
+            headers = {**self.CORS_HEADERS, "Access-Control-Allow-Origin": allow_origin}
+            return Response(status_code=200, headers=headers)
+
+        # Normal request — call the route, then inject CORS headers
+        response = await call_next(request)
+        response.headers["Access-Control-Allow-Origin"] = allow_origin
+        for k, v in self.CORS_HEADERS.items():
+            response.headers[k] = v
+        return response
+
+
+app.add_middleware(PermissiveCORSMiddleware)
 
 # ── Routers ───────────────────────────────────────────────────────────────────
 app.include_router(cv.router,     prefix="/api/cv",     tags=["CV"])
@@ -70,9 +88,3 @@ app.include_router(badges.router, prefix="/api/badges", tags=["Badges"])
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict:
     return {"status": "ok", "service": "auctor-api"}
-
-
-@app.options("/{rest_of_path:path}", include_in_schema=False)
-async def preflight_handler(rest_of_path: str) -> dict:
-    """Catch-all OPTIONS handler so every endpoint responds 200 to preflight."""
-    return {}
