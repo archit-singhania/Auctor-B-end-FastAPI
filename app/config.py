@@ -1,6 +1,5 @@
-"""app/config.py — centralised settings loaded from .env"""
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
 
 
 class Settings(BaseSettings):
@@ -10,7 +9,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── PostgreSQL ────────────────────────────────────────────────────────────
+    # ── PostgreSQL ─────────────────────────────────────────
+    database_url: str | None = None  # ← Railway will provide this
+
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "demo_db"
@@ -20,26 +21,24 @@ class Settings(BaseSettings):
 
     @property
     def db_dsn(self) -> str:
+        # 🔥 PRIORITY: use Railway DATABASE_URL if available
+        if self.database_url:
+            return self.database_url
+
+        # fallback for local development
         return (
             f"postgresql://{self.db_user}:{self.db_password}"
             f"@{self.db_host}:{self.db_port}/{self.db_name}"
         )
 
-    # ── OpenAI ────────────────────────────────────────────────────────────────
+    # ── OpenAI ─────────────────────────────────────────────
     openai_api_key: str = ""
 
-    # ── GitHub ────────────────────────────────────────────────────────────────
+    # ── GitHub ─────────────────────────────────────────────
     github_token: str = ""
 
-    # ── CORS ──────────────────────────────────────────────────────────────────
-    allowed_origins: str = "http://localhost:3000,http://10.0.2.2:8000"
-
-    # ── Score weights ─────────────────────────────────────────────────────────
-    weight_github: float = 0.25
-    weight_leetcode: float = 0.15
-    weight_badges: float = 0.30
-    weight_projects: float = 0.15
-    weight_experience: float = 0.15
+    # ── CORS ───────────────────────────────────────────────
+    allowed_origins: str = "*"
 
     @property
     def cors_origins(self) -> list[str]:
