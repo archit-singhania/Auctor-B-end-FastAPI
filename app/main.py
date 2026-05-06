@@ -36,20 +36,28 @@ app = FastAPI(
 )
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# allow_origins=["*"] is the only safe default for a public API that serves
-# a Flutter Web build from Vercel (which can have many preview subdomains).
-# When allow_origins=["*"], allow_credentials MUST be False — browser rejects
-# credentialed requests to wildcard origins.
-# We explicitly list every header Flutter Web sends so the OPTIONS preflight
-# for multipart/form-data (CV upload) always succeeds.
+# Explicitly list all allowed origins so the browser never gets a mismatch.
+# Wildcard "*" can cause issues with some browser XHR implementations.
+# Add new Vercel preview URLs here if needed.
+ALLOWED_ORIGINS = [
+    "https://auctor-flutter-init.vercel.app",   # production Vercel
+    "https://auctor-f-end-flutter.vercel.app",  # alternate Vercel URL
+    "http://localhost:3000",                     # local web dev
+    "http://localhost:8080",
+    "http://localhost:5000",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:8080",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://auctor.*\.vercel\.app",  # all Vercel preview deployments
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["Content-Type", "X-Request-ID"],
-    max_age=600,
+    max_age=86400,
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
