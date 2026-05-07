@@ -88,3 +88,9 @@ app.include_router(badges.router, prefix="/api/badges", tags=["Badges"])
 @app.get("/health", tags=["Health"])
 async def health_check() -> dict:
     return {"status": "ok", "service": "auctor-api"}
+
+
+@app.get("/ping", tags=["Health"])
+async def ping() -> dict:
+    """Ultra-lightweight endpoint for keep-alive pings (no DB hit)."""
+    return {"pong": True}

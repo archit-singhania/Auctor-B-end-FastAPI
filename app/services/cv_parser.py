@@ -1,11 +1,11 @@
 """
 app/services/cv_parser.py
-──────────────────────────
+--------------------------
 Extracts structured CV data from raw PDF bytes.
 
 Two-step process:
-  1. Text extraction  — pdfminer.six pulls plain text from the PDF
-  2. Structured parse — OpenAI GPT-4o parses skills/projects/experience
+  1. Text extraction  - pdfminer.six pulls plain text from the PDF
+  2. Structured parse - OpenAI GPT-4o parses skills/projects/experience
                         (falls back to regex heuristics if API key is absent)
 """
 
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 class CvParserService:
     """Parses a PDF resume into structured ExtractedCvData."""
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # -- Public API ------------------------------------------------------------
 
     async def parse(self, pdf_bytes: bytes) -> ExtractedCvData:
         """Main entry point. Accepts raw PDF bytes, returns ExtractedCvData."""
@@ -49,7 +49,7 @@ class CvParserService:
         logger.info("Using heuristic CV parser (no OpenAI key configured)")
         return self._heuristic_parse(raw_text)
 
-    # ── Text Extraction ───────────────────────────────────────────────────────
+    # -- Text Extraction -------------------------------------------------------
 
     def _extract_text(self, pdf_bytes: bytes) -> str:
         """Use pdfminer to extract plain text from a PDF byte string."""
@@ -68,7 +68,7 @@ class CvParserService:
             raise ValueError(f"PDF text extraction failed: {exc}") from exc
         return output.getvalue()
 
-    # ── LLM Parse (OpenAI) ────────────────────────────────────────────────────
+    # -- LLM Parse (OpenAI) ---------------------------------------------------
 
     async def _llm_parse(self, raw_text: str) -> ExtractedCvData:
         """Send resume text to OpenAI and ask for structured JSON output."""
@@ -79,7 +79,7 @@ class CvParserService:
         prompt = f"""
 You are an expert resume parser. Extract structured information from this resume text.
 
-Return ONLY a JSON object — no preamble, no markdown fences, no explanation.
+Return ONLY a JSON object - no preamble, no markdown fences, no explanation.
 The JSON must have exactly this structure:
 
 {{
@@ -95,7 +95,7 @@ The JSON must have exactly this structure:
     {{
       "company": "Company Name",
       "role": "Job Title",
-      "duration": "Month Year – Month Year"
+      "duration": "Month Year - Month Year"
     }}
   ]
 }}
@@ -143,7 +143,7 @@ Resume text:
             ],
         )
 
-    # ── Heuristic Parse (no API key) ──────────────────────────────────────────
+    # -- Heuristic Parse (no API key) -----------------------------------------
 
     def _heuristic_parse(self, raw_text: str) -> ExtractedCvData:
         """
@@ -154,9 +154,8 @@ Resume text:
         projects = self._extract_projects_heuristic(raw_text)
         experience = self._extract_experience_heuristic(raw_text)
 
-        # Ensure we always return something useful even with a sparse CV
         if not skills:
-            logger.warning("Heuristic found no skills — returning defaults")
+            logger.warning("Heuristic found no skills -- returning defaults")
             skills = ["See CV for details"]
 
         return ExtractedCvData(skills=skills, projects=projects, experience=experience)
@@ -184,55 +183,123 @@ Resume text:
         return found
 
     def _extract_projects_heuristic(self, text: str) -> list[Project]:
-        """Look for 'Projects' section and extract named items."""
+        """Look for Projects section and extract named items with tech stack."""
         projects: list[Project] = []
-        section = self._extract_section(text, "projects")
+        section = self._extract_section(text, r"projects?")
         if not section:
             return projects
 
-        for line in section.splitlines():
-            line = line.strip()
-            if len(line) > 5 and not line.lower().startswith(("•", "-", "*", "·")):
-                projects.append(
-                    Project(
-                        name=line[:80],
-                        description="",
-                        tech_stack=[],
-                    )
-                )
-            if len(projects) >= 5:
-                break
+        lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
+        i = 0
+        while i < len(lines) and len(projects) < 5:
+            line = lines[i]
+            # Skip very short lines (less than 5 chars) - likely noise
+            if len(line) < 5:
+                i += 1
+                continue
+            # Strip leading bullet/number markers
+            clean = re.sub(r'^[\-\*>\d\.\|]+\s*', '', line).strip()
+            if len(clean) > 8:
+                # Detect tech keywords mentioned in the same line or next 2 lines
+                tech: list[str] = []
+                context = clean
+                for k in range(1, 3):
+                    if i + k < len(lines):
+                        context += ' ' + lines[i + k]
+                for kw in self._TECH_KEYWORDS:
+                    if re.search(rf"\b{re.escape(kw)}\b", context, re.IGNORECASE):
+                        tech.append(kw)
+                # Get description from next line if it looks like a sentence
+                desc = ""
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
+                    if len(next_line) > 15 and not re.match(r'^[\-\*>\d\.]+', next_line):
+                        desc = next_line[:120]
+                projects.append(Project(name=clean[:80], description=desc, tech_stack=tech))
+            i += 1
         return projects
 
     def _extract_experience_heuristic(self, text: str) -> list[Experience]:
+        """Extract employment entries by detecting date ranges and role/company patterns."""
         experiences: list[Experience] = []
-        section = self._extract_section(text, "experience") or self._extract_section(
-            text, "work"
+        section = (
+            self._extract_section(text, r"(?:work\s+)?experience")
+            or self._extract_section(text, r"employment")
+            or self._extract_section(text, r"work history")
         )
         if not section:
             return experiences
 
-        pattern = re.compile(
-            r"(.+?)\s+(?:at|@)\s+(.+?)[\s·|,]+(\w{3}\s+\d{4}.*)",
+        lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
+
+        # Matches: "Jun 2023 - Dec 2023", "2022 - Present", "2021-2023"
+        date_re = re.compile(
+            r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)?"
+            r"\s*\d{4}\s*[-]\s*"
+            r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)?\s*"
+            r"(?:\d{4}|Present|present|current|Current))",
             re.IGNORECASE,
         )
-        for match in pattern.finditer(section):
-            experiences.append(
-                Experience(
-                    role=match.group(1).strip()[:60],
-                    company=match.group(2).strip()[:60],
-                    duration=match.group(3).strip()[:40],
+
+        i = 0
+        while i < len(lines) and len(experiences) < 5:
+            line = lines[i]
+            date_match = date_re.search(line)
+            duration = date_match.group(1).strip() if date_match else ""
+            # Remove date from line to isolate role/company text
+            clean = date_re.sub("", line).strip().strip("|-. ").strip()
+
+            if not clean and i + 1 < len(lines):
+                i += 1
+                clean = lines[i]
+
+            # Try splitting "Role at Company" or "Role | Company" or "Role, Company"
+            sep = re.split(r"\s+(?:at|@|,|\|)\s+", clean, maxsplit=1)
+            if len(sep) == 2:
+                role, company = sep[0].strip(), sep[1].strip()
+            else:
+                role = clean[:60]
+                company = ""
+                # Try next line as company name
+                if i + 1 < len(lines):
+                    nc = date_re.sub("", lines[i + 1]).strip()
+                    if nc and not date_re.search(lines[i + 1]):
+                        company = nc[:60]
+                        i += 1
+
+            if role and len(role) > 3:
+                experiences.append(
+                    Experience(company=company or "Unknown", role=role, duration=duration)
                 )
-            )
-            if len(experiences) >= 5:
-                break
+            i += 1
+
         return experiences
 
     def _extract_section(self, text: str, section_name: str) -> str | None:
         """Extract text between a section header and the next header."""
+        # More permissive: allow leading whitespace, colon after header, etc.
+        # Also handle next section as ANY all-caps or Title Case line >= 4 chars
         pattern = re.compile(
-            rf"^{section_name}\s*\n(.*?)(?=\n[A-Z][A-Za-z ]+\n|\Z)",
+            rf"^\s*{section_name}\s*:?\s*\n(.*?)(?=\n\s*[A-Z][A-Za-z ]+\s*:?\s*\n|\Z)",
             re.IGNORECASE | re.DOTALL | re.MULTILINE,
         )
         match = pattern.search(text)
-        return match.group(1) if match else None
+        if match:
+            return match.group(1)
+        # Fallback: find line containing section name, grab next N lines
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if re.search(rf"\b{section_name}\b", line, re.IGNORECASE) and len(line.strip()) < 40:
+                # Collect up to 40 lines after the header
+                section_lines = []
+                for j in range(i + 1, min(i + 41, len(lines))):
+                    next_line = lines[j]
+                    # Stop if we hit another major section header (short line, mostly alpha)
+                    stripped = next_line.strip()
+                    if stripped and len(stripped) < 35 and re.match(r'^[A-Z][A-Za-z ]+:?
+, stripped):
+                        break
+                    section_lines.append(next_line)
+                if section_lines:
+                    return "\n".join(section_lines)
+        return None
