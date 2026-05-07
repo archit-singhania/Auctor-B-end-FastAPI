@@ -200,7 +200,7 @@ Resume text:
             # Strip leading bullet/number markers
             clean = re.sub(r'^[\-\*>\d\.\|]+\s*', '', line).strip()
             if len(clean) > 8:
-                # Detect tech keywords mentioned in the same line or next 2 lines
+                # Detect tech keywords in this line and the next 2 lines for context
                 tech: list[str] = []
                 context = clean
                 for k in range(1, 3):
@@ -276,9 +276,8 @@ Resume text:
         return experiences
 
     def _extract_section(self, text: str, section_name: str) -> str | None:
-        """Extract text between a section header and the next header."""
-        # More permissive: allow leading whitespace, colon after header, etc.
-        # Also handle next section as ANY all-caps or Title Case line >= 4 chars
+        """Extract text between a section header and the next section header."""
+        # Primary: regex approach — permissive, handles indented headers and colons
         pattern = re.compile(
             rf"^\s*{section_name}\s*:?\s*\n(.*?)(?=\n\s*[A-Z][A-Za-z ]+\s*:?\s*\n|\Z)",
             re.IGNORECASE | re.DOTALL | re.MULTILINE,
@@ -286,18 +285,18 @@ Resume text:
         match = pattern.search(text)
         if match:
             return match.group(1)
-        # Fallback: find line containing section name, grab next N lines
+
+        # Fallback: line-by-line scan for section header keyword
+        section_header_re = re.compile(r'^[A-Z][A-Za-z ]+:?$')
         lines = text.splitlines()
         for i, line in enumerate(lines):
             if re.search(rf"\b{section_name}\b", line, re.IGNORECASE) and len(line.strip()) < 40:
-                # Collect up to 40 lines after the header
                 section_lines = []
                 for j in range(i + 1, min(i + 41, len(lines))):
                     next_line = lines[j]
-                    # Stop if we hit another major section header (short line, mostly alpha)
                     stripped = next_line.strip()
-                    if stripped and len(stripped) < 35 and re.match(r'^[A-Z][A-Za-z ]+:?
-, stripped):
+                    # Stop at next major section header
+                    if stripped and len(stripped) < 35 and section_header_re.match(stripped):
                         break
                     section_lines.append(next_line)
                 if section_lines:
