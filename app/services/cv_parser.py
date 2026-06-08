@@ -286,11 +286,14 @@ The JSON must have exactly this structure:
 
 Rules:
 - skills: technical skills only (languages, frameworks, tools, databases)
-- projects: only named projects with tech context, max 5
+- projects: only named projects with tech context, max 6
 - experience: only real employment/internships, max 5
 - profiles: extract usernames only (not full URLs) for github/linkedin/leetcode/gfg/twitter
 - profiles.email and profiles.phone: exact as found in the text
 - all string values must be non-empty or empty string ""
+- IMPORTANT for projects: each project must have a distinct proper name (e.g. "AccessHub", "HealthSync").
+  Do NOT split a single project description across multiple entries.
+  Do NOT use a sentence fragment as a project name.
 
 Resume text:
 {raw_text[:6000]}
@@ -309,6 +312,23 @@ Resume text:
         data = json.loads(raw_json)
         profiles_raw = data.get("profiles", {})
 
+        projects_raw = data.get("projects", [])
+        # Filter out entries whose name looks like a sentence fragment
+        # (proper project names are typically short — under 8 words — and
+        # don't start with a lowercase letter or a verb fragment)
+        def _is_valid_project_name(name: str) -> bool:
+            if not name:
+                return False
+            words = name.strip().split()
+            if len(words) > 10:
+                return False  # almost certainly a sentence fragment
+            # Reject if it starts with a verb fragment pattern common in bullet points
+            if re.match(r'^(Designed|Developed|Built|Created|Implemented|Integrated|'
+                        r'Engineered|Architected|Improved|Optimized|Used|Leveraged)\b',
+                        name, re.IGNORECASE):
+                return False
+            return True
+
         return ExtractedCvData(
             skills=data.get("skills", []),
             projects=[
@@ -317,8 +337,8 @@ Resume text:
                     description=p.get("description", ""),
                     tech_stack=p.get("tech_stack", []),
                 )
-                for p in data.get("projects", [])
-                if p.get("name")
+                for p in projects_raw
+                if p.get("name") and _is_valid_project_name(p.get("name", ""))
             ],
             experience=[
                 Experience(
@@ -380,86 +400,181 @@ Resume text:
                 found.append(kw)
         return found
 
+    # Project name patterns — lines that look like proper project titles
+    # (short, title-case, optionally with a dash/subtitle)
+    _PROJECT_TITLE_RE = re.compile(
+        r'^([A-Z][A-Za-z0-9]+(?:[\s\-–]+[A-Za-z0-9]+){0,6})$'
+    )
+
     def _extract_projects_heuristic(self, text: str) -> list[Project]:
+        """
+        Heuristic project extractor.
+
+        Strategy: find the PROJECTS section, then identify project titles as
+        short title-case lines that are followed by description/tech lines.
+        Group continuation lines (description + tech bullets) under the same
+        project until the next title-like line appears.
+        """
         projects: list[Project] = []
-        section = self._extract_section(text, r"projects?")
+        section = self._extract_section(text, r"(?:university\s+&?\s+personal\s+)?projects?")
+        if not section:
+            # Try broader search in the full text for named project blocks
+            section = self._extract_section(text, r"projects?")
         if not section:
             return projects
 
         lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
-        i = 0
-        while i < len(lines) and len(projects) < 5:
-            line = lines[i]
-            if len(line) < 5:
-                i += 1
-                continue
-            clean = re.sub(r'^[\-\*>\d\.\|]+\s*', '', line).strip()
-            if len(clean) > 8:
-                tech: list[str] = []
-                context = clean
-                for k in range(1, 3):
-                    if i + k < len(lines):
-                        context += ' ' + lines[i + k]
-                for kw in self._TECH_KEYWORDS:
-                    if re.search(rf"\b{re.escape(kw)}\b", context, re.IGNORECASE):
-                        tech.append(kw)
-                desc = ""
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
-                    if len(next_line) > 15 and not re.match(r'^[\-\*>\d\.]+', next_line):
-                        desc = next_line[:120]
-                projects.append(Project(name=clean[:80], description=desc, tech_stack=tech))
-            i += 1
+        if not lines:
+            return projects
+
+        def _is_project_title(line: str) -> bool:
+            """A project title is short, starts with a capital, and is NOT a sentence."""
+            if len(line) > 90:
+                return False
+            word_count = len(line.split())
+            if word_count > 9:
+                return False
+            # Must start with a capital letter
+            if not line[0].isupper():
+                return False
+            # Reject if it starts with a common description verb
+            if re.match(
+                r'^(Designed|Developed|Built|Created|Implemented|Integrated|'
+                r'Engineered|Architected|Improved|Optimized|Used|Leveraged|'
+                r'Currently|Took|Spent|Collaborated|Worked)\b',
+                line, re.IGNORECASE
+            ):
+                return False
+            # Reject date-only or company-only lines
+            if re.match(r'^\d{4}', line):
+                return False
+            return True
+
+        # Group lines into (title, [body_lines]) chunks
+        chunks: list[tuple[str, list[str]]] = []
+        current_title: str | None = None
+        current_body: list[str] = []
+
+        for line in lines:
+            if _is_project_title(line):
+                if current_title:
+                    chunks.append((current_title, current_body))
+                current_title = line
+                current_body = []
+            else:
+                if current_title:
+                    current_body.append(line)
+                # else: preamble noise before first title — skip
+
+        if current_title:
+            chunks.append((current_title, current_body))
+
+        for title, body_lines in chunks:
+            if len(projects) >= 6:
+                break
+            full_context = title + " " + " ".join(body_lines)
+            tech: list[str] = []
+            for kw in self._TECH_KEYWORDS:
+                if re.search(rf"\b{re.escape(kw)}\b", full_context, re.IGNORECASE):
+                    tech.append(kw)
+
+            # Use the first body line (if any) as description, truncated
+            desc = ""
+            for bl in body_lines:
+                if len(bl) > 20:
+                    desc = bl[:160]
+                    break
+
+            projects.append(Project(
+                name=title[:80],
+                description=desc,
+                tech_stack=tech,
+            ))
+
         return projects
 
     def _extract_experience_heuristic(self, text: str) -> list[Experience]:
         experiences: list[Experience] = []
         section = (
-            self._extract_section(text, r"(?:work\s+)?experience")
+            self._extract_section(text, r"(?:professional\s+)?(?:work\s+)?experience")
             or self._extract_section(text, r"employment")
             or self._extract_section(text, r"work history")
         )
         if not section:
             return experiences
 
-        lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
-
+        # ── Strategy: find lines with a date range; treat them as job entries ──
         date_re = re.compile(
             r"((?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)?"
-            r"\s*\d{4}\s*[-]\s*"
+            r"\s*\d{4}\s*[-–]\s*"
             r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)?\s*"
             r"(?:\d{4}|Present|present|current|Current))",
             re.IGNORECASE,
         )
 
-        i = 0
-        while i < len(lines) and len(experiences) < 5:
-            line = lines[i]
-            date_match = date_re.search(line)
-            duration = date_match.group(1).strip() if date_match else ""
-            clean = date_re.sub("", line).strip().strip("|-. ").strip()
+        lines = [ln.strip() for ln in section.splitlines() if ln.strip()]
 
-            if not clean and i + 1 < len(lines):
+        # First pass: find all lines that contain a date range — those are job headers
+        job_header_indices = [
+            i for i, ln in enumerate(lines) if date_re.search(ln)
+        ]
+
+        if job_header_indices:
+            for idx in job_header_indices:
+                if len(experiences) >= 5:
+                    break
+                header = lines[idx]
+                date_match = date_re.search(header)
+                duration = date_match.group(1).strip() if date_match else ""
+
+                # Remove date from header to get company/role text
+                header_clean = date_re.sub("", header).strip().strip("|-,.").strip()
+
+                # Try to split "Role at Company" or "Role — Company" or "Role | Company"
+                sep = re.split(r'\s+(?:at|@|—|–|\|)\s+', header_clean, maxsplit=1)
+                if len(sep) == 2:
+                    role, company = sep[0].strip()[:80], sep[1].strip()[:80]
+                else:
+                    # Company is likely on the previous line
+                    role = header_clean[:80]
+                    company = lines[idx - 1][:80] if idx > 0 else "Unknown"
+
+                if role and len(role) > 2:
+                    experiences.append(Experience(
+                        company=company or "Unknown",
+                        role=role,
+                        duration=duration,
+                    ))
+        else:
+            # Fallback: original line-by-line approach
+            i = 0
+            while i < len(lines) and len(experiences) < 5:
+                line = lines[i]
+                date_match = date_re.search(line)
+                duration = date_match.group(1).strip() if date_match else ""
+                clean = date_re.sub("", line).strip().strip("|-. ").strip()
+
+                if not clean and i + 1 < len(lines):
+                    i += 1
+                    clean = lines[i]
+
+                sep = re.split(r"\s+(?:at|@|,|\|)\s+", clean, maxsplit=1)
+                if len(sep) == 2:
+                    role, company = sep[0].strip(), sep[1].strip()
+                else:
+                    role = clean[:60]
+                    company = ""
+                    if i + 1 < len(lines):
+                        nc = date_re.sub("", lines[i + 1]).strip()
+                        if nc and not date_re.search(lines[i + 1]):
+                            company = nc[:60]
+                            i += 1
+
+                if role and len(role) > 3:
+                    experiences.append(
+                        Experience(company=company or "Unknown", role=role, duration=duration)
+                    )
                 i += 1
-                clean = lines[i]
-
-            sep = re.split(r"\s+(?:at|@|,|\|)\s+", clean, maxsplit=1)
-            if len(sep) == 2:
-                role, company = sep[0].strip(), sep[1].strip()
-            else:
-                role = clean[:60]
-                company = ""
-                if i + 1 < len(lines):
-                    nc = date_re.sub("", lines[i + 1]).strip()
-                    if nc and not date_re.search(lines[i + 1]):
-                        company = nc[:60]
-                        i += 1
-
-            if role and len(role) > 3:
-                experiences.append(
-                    Experience(company=company or "Unknown", role=role, duration=duration)
-                )
-            i += 1
 
         return experiences
 
@@ -475,12 +590,12 @@ Resume text:
         section_header_re = re.compile(r'^[A-Z][A-Za-z ]+:?$')
         lines = text.splitlines()
         for i, line in enumerate(lines):
-            if re.search(rf"\b{section_name}\b", line, re.IGNORECASE) and len(line.strip()) < 40:
+            if re.search(rf"\b{section_name}\b", line, re.IGNORECASE) and len(line.strip()) < 50:
                 section_lines = []
-                for j in range(i + 1, min(i + 41, len(lines))):
+                for j in range(i + 1, min(i + 60, len(lines))):
                     next_line = lines[j]
                     stripped = next_line.strip()
-                    if stripped and len(stripped) < 35 and section_header_re.match(stripped):
+                    if stripped and len(stripped) < 40 and section_header_re.match(stripped):
                         break
                     section_lines.append(next_line)
                 if section_lines:
