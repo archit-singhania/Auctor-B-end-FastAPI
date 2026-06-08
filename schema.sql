@@ -19,8 +19,8 @@ CREATE TABLE IF NOT EXISTS auctor.users (
 
 -- ── cv_data ───────────────────────────────────────────────────────────────────
 -- Stores the structured output of the most-recent CV parse for each user.
--- skills / projects / experience are JSONB arrays so the schema stays flexible
--- as the CV parser evolves without needing migrations.
+-- skills / projects / experience / profiles are JSONB so the schema stays
+-- flexible as the CV parser evolves without needing migrations.
 -- A user can re-upload; the router deletes the old row and inserts fresh.
 CREATE TABLE IF NOT EXISTS auctor.cv_data (
     id          SERIAL PRIMARY KEY,
@@ -28,9 +28,13 @@ CREATE TABLE IF NOT EXISTS auctor.cv_data (
     skills      JSONB NOT NULL DEFAULT '[]',
     projects    JSONB NOT NULL DEFAULT '[]',
     experience  JSONB NOT NULL DEFAULT '[]',
+    profiles    JSONB NOT NULL DEFAULT '{}',
     parsed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS cv_data_user_idx ON auctor.cv_data(user_id);
+
+-- Migration: add profiles column if upgrading from an older schema
+ALTER TABLE auctor.cv_data ADD COLUMN IF NOT EXISTS profiles JSONB NOT NULL DEFAULT '{}';
 
 -- ── verifications ─────────────────────────────────────────────────────────────
 -- One row per (user × platform) verification.

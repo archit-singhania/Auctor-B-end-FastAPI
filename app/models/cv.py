@@ -22,8 +22,21 @@ class Experience(BaseModel):
     is_verified: bool = Field(False, description="Set to True when offer letter is verified")
 
 
+class ExtractedProfiles(BaseModel):
+    """External profile links and contact info extracted from the CV."""
+    email: str = Field("", description="Primary email address")
+    phone: str = Field("", description="Phone number with country code if present")
+    github: str = Field("", description="GitHub profile URL or username")
+    linkedin: str = Field("", description="LinkedIn profile URL or username slug")
+    leetcode: str = Field("", description="LeetCode profile URL or username")
+    geeksforgeeks: str = Field("", description="GeeksForGeeks profile URL or username")
+    portfolio: str = Field("", description="Personal website or portfolio URL")
+    twitter: str = Field("", description="Twitter/X handle or URL")
+
+
 class ExtractedCvData(BaseModel):
     """Full structured output of a CV parse operation."""
     skills: list[str] = Field(default_factory=list)
     projects: list[Project] = Field(default_factory=list)
     experience: list[Experience] = Field(default_factory=list)
+    profiles: ExtractedProfiles = Field(default_factory=ExtractedProfiles)

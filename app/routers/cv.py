@@ -72,13 +72,14 @@ async def parse_cv(
                 await conn.execute("DELETE FROM cv_data WHERE user_id = $1", user_id)
                 await conn.execute(
                     """
-                    INSERT INTO cv_data (user_id, skills, projects, experience)
-                    VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb)
+                    INSERT INTO cv_data (user_id, skills, projects, experience, profiles)
+                    VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb)
                     """,
                     user_id,
                     json.dumps(data.skills),
                     json.dumps([p.model_dump() for p in data.projects]),
                     json.dumps([e.model_dump() for e in data.experience]),
+                    json.dumps(data.profiles.model_dump()),
                 )
         finally:
             await release_conn(conn)
