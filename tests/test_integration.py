@@ -10,14 +10,20 @@ from app.config import settings
 from app.main import app
 from app.domain import CATALOG
 
+@pytest.fixture(autouse=True)
+def isolated_rate_limits():
+    from app.platform import LIMITS
+    LIMITS.clear()
+
 @pytest.fixture(scope='module')
-def client():
+def client(tmp_path_factory):
     if os.getenv('AUCTOR_TEST_LOCAL')!='1': pytest.skip('Set AUCTOR_TEST_LOCAL=1 for an isolated local PostgreSQL schema')
     dsn=os.getenv('AUCTOR_TEST_DSN',settings.db_dsn)
     if urlparse(dsn).hostname not in ('localhost','127.0.0.1','::1'): pytest.fail('Tests refuse non-local PostgreSQL')
-    previous=(settings.database_url,settings.db_schema,settings.reviewer_emails)
+    previous=(settings.database_url,settings.db_schema,settings.reviewer_emails,settings.storage_path,settings.app_env)
     schema='auctor_test_'+secrets.token_hex(8)
     settings.database_url=dsn; settings.db_schema=schema; settings.reviewer_emails='reviewer@example.test'
+    settings.storage_path=str(tmp_path_factory.mktemp('auctor-private-files')); settings.app_env='test'
     try:
         with TestClient(app) as client: yield client
     finally:
@@ -26,7 +32,7 @@ def client():
             try: await conn.execute('DROP SCHEMA '+schema+' CASCADE')
             finally: await conn.close()
         asyncio.run(cleanup())
-        settings.database_url,settings.db_schema,settings.reviewer_emails=previous
+        settings.database_url,settings.db_schema,settings.reviewer_emails,settings.storage_path,settings.app_env=previous
 
 def account(client,email,handle):
     response=client.post('/api/auth/register',json={'email':email,'password':'integration-password-123','handle':handle,'display_name':handle})
@@ -144,3 +150,62 @@ def test_persistent_cv_job_readback_and_source_ownership(client,monkeypatch):
     assert 'Docker' in saved['cv']['skills']
     assert saved['documents'][0]['source']['verified'] is False
     assert saved['versions']
+
+
+def test_revision_proof_review_recruiter_and_account_lifecycle(client):
+    owner=account(client,'lifecycle@example.test','lifecycle-developer')
+    reader=account(client,'lifecycle-reader@example.test','lifecycle-reader')
+    reviewer=account(client,'lifecycle-reviewer@example.test','lifecycle-reviewer')
+    cv={'skills':['Docker'],'projects':[],'experience':[],'profiles':{'email':'private-lifecycle@example.test'}}
+    assert client.put('/api/cv',headers=owner,json={'data':cv}).status_code==200
+    version=client.get('/api/me',headers=owner).json()['versions'][0]['id']
+    assert client.put('/api/cv',headers=owner,json={'data':{**cv,'skills':['Redis']}}).status_code==200
+    assert client.post(f'/api/cv/versions/{version}/restore',headers=reader).status_code==404
+    assert client.post(f'/api/cv/versions/{version}/restore',headers=owner).status_code==200
+    assert client.get('/api/me',headers=owner).json()['cv']['skills']==['Docker']
+    assert len(client.get('/api/challenges',headers=owner).json())==5
+    uid=client.get('/api/me',headers=owner).json()['profile']['id']
+    async def role_and_running_job():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("UPDATE users SET role='reviewer' WHERE email IN ('lifecycle@example.test','lifecycle-reviewer@example.test')")
+            await c.execute("INSERT INTO documents(id,user_id,filename,storage_key,status,run_token) VALUES('lifecycle-job',$1,'test.pdf','test-only-missing.pdf','running','isolated-lease')",uid)
+    client.portal.call(role_and_running_job)
+    assert client.post('/api/cv/jobs/lifecycle-job/cancel',headers=reader).status_code==404
+    assert client.post('/api/cv/jobs/lifecycle-job/cancel',headers=owner).status_code==200
+    assert client.get('/api/cv/jobs/lifecycle-job',headers=owner).json()['status']=='cancelled'
+    assert client.post('/api/cv/jobs/lifecycle-job/retry',headers=owner).status_code==200
+    assert client.get('/api/cv/jobs/lifecycle-job',headers=owner).json()['status'] in ('queued','running','failed')
+    proof=b'%PDF-1.4\n% isolated proof access fixture\n%%EOF'
+    for kind in ('experience','certificate'):
+        eid=client.post('/api/evidence',headers=owner,json={'kind':kind,'title':'Isolated '+kind}).json()['id']
+        assert client.post('/api/reviews/'+eid,headers=owner,json={'status':'verified','note':'I reviewed my own evidence'}).status_code==403
+        assert client.post('/api/evidence/'+eid+'/file',headers=reader,files={'file':('proof.pdf',proof,'application/pdf')}).status_code==404
+        assert client.post('/api/evidence/'+eid+'/file',headers=owner,files={'file':('proof.pdf',proof,'application/pdf')}).status_code==200
+        assert client.get('/api/evidence/'+eid+'/file',headers=reader).status_code==404
+        assert client.get('/api/evidence/'+eid+'/file',headers=owner).content==proof
+        assert client.get('/api/evidence/'+eid+'/file',headers=reviewer).content==proof
+        assert client.post('/api/reviews/'+eid,headers=reviewer,json={'status':'verified','note':'Independently inspected this private proof'}).status_code==200
+        assert client.post('/api/evidence/'+eid+'/file',headers=owner,files={'file':('changed.pdf',proof,'application/pdf')}).status_code==409
+        assert client.delete('/api/evidence/'+eid,headers=reader).status_code==404
+    assert client.get('/api/me',headers=owner).json()['score']['total']==1.5
+    prefs={'theme':'dark','reduced_motion':True,'reduced_transparency':True}
+    assert client.patch('/api/me',headers=owner,json={'display_name':'Lifecycle Developer','discoverable':True,'preferences':prefs}).status_code==200
+    assert client.get('/api/me',headers=owner).json()['profile']['preferences']==prefs
+    assert client.post(f'/api/candidates/{uid}/save',headers=reader).status_code==200
+    assert client.get('/api/candidates?q=lifecycle-developer',headers=reader).json()[0]['saved'] is True
+    assert client.get('/api/candidates?q=lifecycle-developer',headers=reviewer).json()[0]['saved'] is False
+    assert client.delete(f'/api/candidates/{uid}/save',headers=reader).status_code==200
+    assert client.get('/api/candidates?q=lifecycle-developer',headers=reader).json()[0]['saved'] is False
+    export=client.get('/api/export?format=json',headers=owner).json()
+    assert 'private-lifecycle@example.test' not in str(export)
+    assert all('storage_key' not in e for e in export['evidence'])
+    assert client.post('/api/activity/read',headers=owner).status_code==200
+    workspace=client.get('/api/me',headers=owner).json()
+    assert workspace['activity'] and all(a['read'] for a in workspace['activity'])
+    assert len(workspace['history'])>=2
+    for e in workspace['evidence']:
+        assert client.delete('/api/evidence/'+e['id'],headers=owner).status_code==200
+    assert client.get('/api/me',headers=owner).json()['score']['total']==0
+    assert client.post('/api/auth/logout',headers=owner).status_code==200
+    assert client.get('/api/me',headers=owner).status_code==401

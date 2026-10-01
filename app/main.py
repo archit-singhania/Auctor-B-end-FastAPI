@@ -12,6 +12,7 @@ from app.platform import router, job_worker
 logger=logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app):
+    settings.prepare_storage()
     score_from([],[],[],{k:getattr(settings,'weight_'+k) for k in WEIGHTS})
     await create_pool()
     worker=asyncio.create_task(job_worker())
@@ -40,7 +41,7 @@ async def health():
     try:
         await c.fetchval('SELECT 1')
         version=await c.fetchval('SELECT MAX(version) FROM schema_versions')
-        return {'status':'ready','database':'connected','schema_version':version,'service':'auctor-api'}
+        return {'status':'ready','database':'connected','schema_version':version,'service':'auctor-api','environment':settings.app_env,'storage':settings.storage_mode}
     finally: await release_conn(c)
 
 @app.get('/ping')

@@ -204,6 +204,9 @@ async def save_file(file,folder):
     dest=root/key
     await asyncio.to_thread(dest.parent.mkdir,parents=True,exist_ok=True)
     await asyncio.to_thread(dest.write_bytes,content)
+    if settings.app_env == 'production':
+        import os
+        if os.name != 'nt': await asyncio.to_thread(dest.chmod,0o600)
     return key
 
 @router.post('/cv/jobs',status_code=202)
@@ -233,11 +236,12 @@ async def cv_source(job_id:str,user=Depends(current_user)):
 async def job_action(job_id:str,action:str,user=Depends(current_user)):
     if action not in ('cancel','retry'): raise HTTPException(404,'Unknown job action')
     async with db() as c:
-        row=await c.fetchrow('SELECT status FROM documents WHERE id=$1 AND user_id=$2 FOR UPDATE',job_id,user['id'])
-        if not row: raise HTTPException(404,'Job not found')
-        if action=='retry' and row['status'] not in ('failed','cancelled'): raise HTTPException(409,'Only failed or cancelled jobs can retry')
-        if action=='cancel' and row['status'] not in ('queued','running'): raise HTTPException(409,'Job has already finished')
-        await c.execute('UPDATE documents SET status=$2,error=NULL,updated_at=NOW() WHERE id=$1',job_id,'cancelled' if action=='cancel' else 'queued')
+        async with c.transaction():
+            row=await c.fetchrow('SELECT status FROM documents WHERE id=$1 AND user_id=$2 FOR UPDATE',job_id,user['id'])
+            if not row: raise HTTPException(404,'Job not found')
+            if action=='retry' and row['status'] not in ('failed','cancelled'): raise HTTPException(409,'Only failed or cancelled jobs can retry')
+            if action=='cancel' and row['status'] not in ('queued','running'): raise HTTPException(409,'Job has already finished')
+            await c.execute('UPDATE documents SET status=$2,error=NULL,updated_at=NOW() WHERE id=$1',job_id,'cancelled' if action=='cancel' else 'queued')
     return {'ok':True}
 
 async def job_worker():
@@ -346,7 +350,9 @@ async def attach_proof(evidence_id:str,file:UploadFile=File(...),user=Depends(cu
         if not row: raise HTTPException(404,'Evidence not found')
         if row['kind']=='project' or row['status']=='verified': raise HTTPException(409,'Create a new evidence submission to update reviewed proof')
     key=await save_file(file,'proof')
-    async with db() as c: await c.execute("UPDATE evidence SET storage_key=$2,status='pending',updated_at=NOW() WHERE id=$1 AND user_id=$3",evidence_id,key,user['id'])
+    async with db() as c:
+        updated=await c.fetchval("UPDATE evidence SET storage_key=$2,status='pending',updated_at=NOW() WHERE id=$1 AND user_id=$3 AND status<>'verified' AND kind<>'project' RETURNING id",evidence_id,key,user['id'])
+        if not updated: raise HTTPException(409,'Evidence was reviewed or removed while the file uploaded. Create a new submission')
     return {'ok':True}
 
 @router.get('/evidence/{evidence_id}/file')
