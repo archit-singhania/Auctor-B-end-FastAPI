@@ -14,6 +14,7 @@ How it works:
 
 import logging
 import pathlib
+import re
 import asyncpg
 from app.config import settings
 
@@ -48,7 +49,10 @@ async def run_migrations() -> None:
         logger.warning("schema.sql not found at %s — skipping migrations", schema_path)
         return
 
-    sql = schema_path.read_text(encoding="utf-8")
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,62}", settings.db_schema):
+        raise ValueError("DB_SCHEMA must be a lowercase PostgreSQL identifier")
+    sql = schema_path.read_text(encoding="utf-8-sig")
+    sql = sql.replace("CREATE SCHEMA IF NOT EXISTS auctor", f"CREATE SCHEMA IF NOT EXISTS {settings.db_schema}").replace("SET search_path = auctor", f"SET search_path = {settings.db_schema}").replace("auctor.", f"{settings.db_schema}.")
     try:
         conn = await _pool.acquire()  # type: ignore[union-attr]
         try:
@@ -58,7 +62,7 @@ async def run_migrations() -> None:
             await _pool.release(conn)  # type: ignore[union-attr]
     except Exception as exc:
         logger.error("DB migration failed: %s", exc)
-        # Don't crash startup — app can still serve requests that don't need DB
+        raise
 
 
 async def close_pool() -> None:

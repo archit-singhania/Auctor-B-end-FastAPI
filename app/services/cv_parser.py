@@ -16,6 +16,7 @@ import io
 import json
 import re
 import logging
+import asyncio
 
 from pdfminer.high_level import extract_text_to_fp
 from pdfminer.layout import LAParams
@@ -33,7 +34,7 @@ class CvParserService:
 
     async def parse(self, pdf_bytes: bytes) -> ExtractedCvData:
         """Main entry point. Accepts raw PDF bytes, returns ExtractedCvData."""
-        raw_text = self._extract_text(pdf_bytes)
+        raw_text = await asyncio.to_thread(self._extract_text, pdf_bytes)
 
         if not raw_text or not raw_text.strip():
             raise ValueError(

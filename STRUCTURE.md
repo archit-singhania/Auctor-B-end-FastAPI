@@ -1,25 +1,11 @@
-auctor_fastapi/
-├── app/
-│   ├── __init__.py
-│   ├── main.py                  ← FastAPI app entry point, CORS, router mounts
-│   ├── config.py                ← Settings (env vars, GitHub token, etc.)
-│   ├── models/
-│   │   ├── __init__.py
-│   │   ├── cv.py                ← Pydantic schemas for CV data
-│   │   ├── score.py             ← Pydantic schemas for AuctorScore
-│   │   ├── badge.py             ← Pydantic schemas for Badge submission
-│   │   └── github.py            ← Pydantic schemas for GitHub verify
-│   ├── routers/
-│   │   ├── __init__.py
-│   │   ├── cv.py                ← POST /api/cv/parse
-│   │   ├── verify.py            ← GET /api/verify/github
-│   │   ├── score.py             ← GET /api/score
-│   │   └── badges.py            ← POST /api/badges/submit
-│   └── services/
-│       ├── __init__.py
-│       ├── cv_parser.py         ← PDF text extraction + LLM skill extraction
-│       ├── github_service.py    ← GitHub API calls + project matching
-│       └── score_service.py     ← Score calculation engine
-├── requirements.txt
-├── .env.example
-└── README.md
+# Active architecture
+
+- `app/main.py`: lifecycle, explicit CORS, security headers and readiness.
+- `app/platform.py`: owned API operations and durable parser-worker loop.
+- `app/domain.py`: pure password, question-grading and score-v1 rules.
+- `app/services/cv_parser.py`: optional AI extraction with heuristic fallback.
+- `app/db.py`, `schema.sql`: async PostgreSQL pooling and additive migrations.
+- `app/manage.py`: private operator reviewer-role assignment.
+- `tests/`: isolated multi-user integration journeys and pure rule tests.
+
+The older router/service modules are preserved for migration reference and are not mounted in v2. Their demo-user contracts must not be reenabled.

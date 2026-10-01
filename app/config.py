@@ -4,7 +4,7 @@ import os
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=(".env", ".env.local"),
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     db_port: int = 5432
     db_name: str = "demo_db"
     db_user: str = "postgres"
-    db_password: str = "2526"
+    db_password: str = ""
     db_schema: str = "auctor"
 
     @property
@@ -45,7 +45,13 @@ class Settings(BaseSettings):
     weight_experience: float = 0.15
 
     # ── CORS ───────────────────────────────────────────────
-    allowed_origins: str = "*"
+    allowed_origins: str = "http://localhost:3000,http://localhost:8080"
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    github_redirect_uri: str = "http://localhost:8000/api/github/callback"
+    web_url: str = "http://localhost:8080"
+    reviewer_emails: str = ""
+    storage_path: str = "_data"
 
     @property
     def cors_origins(self) -> list[str]:

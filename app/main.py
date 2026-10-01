@@ -1,96 +1,47 @@
-"""
-app/main.py — FastAPI application entry point.
+"""Auctor API entrypoint: explicit origins, durable jobs and dependency readiness."""
+import asyncio
+from contextlib import asynccontextmanager, suppress
+import logging
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from app.config import settings
+from app.db import create_pool, close_pool, get_conn, release_conn
+from app.domain import WEIGHTS, score_from
+from app.platform import router, job_worker
 
-Data flow (real mode):
-  Flutter → POST /api/cv/parse       → pdfminer + OpenAI → INSERT cv_data
-  Flutter → GET  /api/verify/github  → GitHub API        → UPSERT verifications
-  Flutter → POST /api/badges/submit  → pass/fail logic   → UPSERT badges + scores
-  Flutter → GET  /api/score          → SELECT scores      → return AuctorScore
-
-Run:
-  uvicorn app.main:app --reload --port 8000
-"""
-
-import re
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Response
-from starlette.middleware.base import BaseHTTPMiddleware
-
-from app.db import create_pool, close_pool
-from app.routers import cv, verify, score, badges
-
-
+logger=logging.getLogger(__name__)
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Open DB pool on startup, close it on shutdown."""
+async def lifespan(app):
+    score_from([],[],[],{k:getattr(settings,'weight_'+k) for k in WEIGHTS})
     await create_pool()
-    yield
-    await close_pool()
+    worker=asyncio.create_task(job_worker())
+    try:
+        yield
+    finally:
+        worker.cancel()
+        with suppress(asyncio.CancelledError): await worker
+        await close_pool()
 
+app=FastAPI(title='Auctor evidence platform',version='2.0.0',lifespan=lifespan,description='Owned CV evidence, server-graded skill challenges and explainable provenance.')
+app.add_middleware(CORSMiddleware,allow_origins=settings.cors_origins,allow_methods=['GET','POST','PUT','PATCH','DELETE'],allow_headers=['Authorization','Content-Type'],expose_headers=['Content-Disposition'],allow_credentials=False)
 
-app = FastAPI(
-    title="Auctor API",
-    description="Developer Trust Score — CV parsing, GitHub verification, badge scoring.",
-    version="1.0.0",
-    lifespan=lifespan,
-)
+@app.middleware('http')
+async def security_headers(request:Request,call_next):
+    response=await call_next(request)
+    response.headers['X-Content-Type-Options']='nosniff'
+    response.headers['Referrer-Policy']='no-referrer'
+    response.headers['Cache-Control']='no-store'
+    return response
 
+app.include_router(router)
+@app.get('/health')
+async def health():
+    c=await get_conn()
+    try:
+        await c.fetchval('SELECT 1')
+        version=await c.fetchval('SELECT MAX(version) FROM schema_versions')
+        return {'status':'ready','database':'connected','schema_version':version,'service':'auctor-api'}
+    finally: await release_conn(c)
 
-# ── Custom CORS middleware (replaces CORSMiddleware entirely) ─────────────────
-# CORSMiddleware has edge cases with multipart preflight + wildcard origins.
-# This custom middleware is explicit and handles every case correctly.
-class PermissiveCORSMiddleware(BaseHTTPMiddleware):
-    # Regex: allow any Vercel preview + localhost for dev
-    _ORIGIN_RE = re.compile(
-        r"^https://[\w-]+\.vercel\.app$"
-        r"|^http://localhost(:\d+)?$"
-        r"|^http://127\.0\.0\.1(:\d+)?$"
-    )
-
-    CORS_HEADERS = {
-        "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
-        "Access-Control-Allow-Headers": "*",
-        "Access-Control-Expose-Headers": "Content-Type, X-Request-ID",
-        "Access-Control-Max-Age": "86400",
-    }
-
-    async def dispatch(self, request: Request, call_next):
-        origin = request.headers.get("origin", "")
-
-        # Decide which origin to echo back
-        if self._ORIGIN_RE.match(origin):
-            allow_origin = origin   # echo the exact origin back
-        else:
-            allow_origin = "*"      # non-browser or unknown origin — use wildcard
-
-        # Short-circuit OPTIONS (preflight) — never forward to app
-        if request.method == "OPTIONS":
-            headers = {**self.CORS_HEADERS, "Access-Control-Allow-Origin": allow_origin}
-            return Response(status_code=200, headers=headers)
-
-        # Normal request — call the route, then inject CORS headers
-        response = await call_next(request)
-        response.headers["Access-Control-Allow-Origin"] = allow_origin
-        for k, v in self.CORS_HEADERS.items():
-            response.headers[k] = v
-        return response
-
-
-app.add_middleware(PermissiveCORSMiddleware)
-
-# ── Routers ───────────────────────────────────────────────────────────────────
-app.include_router(cv.router,     prefix="/api/cv",     tags=["CV"])
-app.include_router(verify.router, prefix="/api/verify", tags=["Verification"])
-app.include_router(score.router,  prefix="/api",        tags=["Score"])
-app.include_router(badges.router, prefix="/api/badges", tags=["Badges"])
-
-
-@app.get("/health", tags=["Health"])
-async def health_check() -> dict:
-    return {"status": "ok", "service": "auctor-api"}
-
-
-@app.get("/ping", tags=["Health"])
-async def ping() -> dict:
-    """Ultra-lightweight endpoint for keep-alive pings (no DB hit)."""
-    return {"pong": True}
+@app.get('/ping')
+async def ping(): return {'pong':True}
