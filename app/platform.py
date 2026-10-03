@@ -9,6 +9,8 @@ from pathlib import Path
 import secrets
 import time
 from urllib.parse import urlencode
+from urllib.parse import urlsplit
+import hashlib
 
 import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
@@ -18,6 +20,7 @@ from app.config import settings
 from app.db import get_conn, release_conn
 from app.domain import CATALOG, check_password, grade, hash_password, public_question, score_from, token_hash
 from app.services.cv_parser import CvParserService
+from app.insights import build_insights, signal_snapshot
 
 router = APIRouter(prefix='/api')
 LIMITS={}
@@ -28,7 +31,7 @@ def decode(value):
 
 def record(row):
     out=dict(row)
-    for k in ('data','source','detail','preferences','github_identity','score','question_ids','answers'):
+    for k in ('data','source','detail','preferences','github_identity','score','signals','question_ids','answers'):
         if k in out and out[k] is not None: out[k]=decode(out[k])
     out.pop('password_hash',None)
     out.pop('run_token',None)
@@ -67,9 +70,10 @@ async def recalculate(c,uid,reason):
     data=await cv_data(c,uid)
     weights={k:getattr(settings,'weight_'+k) for k in ('github','leetcode','badges','projects','experience')}
     score=score_from(evidence,badges,data.get('projects',[]),weights)
-    last=await c.fetchval('SELECT score FROM score_history WHERE user_id=$1 ORDER BY id DESC LIMIT 1',uid)
-    if last is None or decode(last)!=score:
-        await c.execute('INSERT INTO score_history(user_id,score,reason) VALUES($1,$2::jsonb,$3)',uid,json.dumps(score),reason)
+    signals=signal_snapshot(data,evidence,badges)
+    last=await c.fetchrow('SELECT score,signals FROM score_history WHERE user_id=$1 ORDER BY id DESC LIMIT 1',uid)
+    if last is None or decode(last['score'])!=score or decode(last['signals'])!=signals:
+        await c.execute('INSERT INTO score_history(user_id,score,reason,signals) VALUES($1,$2::jsonb,$3,$4::jsonb)',uid,json.dumps(score),reason,json.dumps(signals))
     return score
 
 class Credentials(BaseModel):
@@ -169,7 +173,11 @@ async def me(user=Depends(current_user)):
     async with db() as c:
         uid=user['id']
         score=await recalculate(c,uid,'Workspace refreshed')
-        return {'profile':user,'cv':await cv_data(c,uid),'score':score,'evidence':[record(r) for r in await c.fetch('SELECT * FROM evidence WHERE user_id=$1 ORDER BY created_at DESC',uid)],'documents':[record(r) for r in await c.fetch('SELECT * FROM documents WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30',uid)],'versions':[record(r) for r in await c.fetch('SELECT * FROM cv_versions WHERE user_id=$1 ORDER BY id DESC LIMIT 30',uid)],'badges':[record(r) for r in await c.fetch('SELECT id,badge_id,started_at,submitted_at,correct_count,passed,score_delta FROM attempts WHERE user_id=$1 ORDER BY started_at DESC LIMIT 50',uid)],'history':[record(r) for r in await c.fetch('SELECT * FROM score_history WHERE user_id=$1 ORDER BY id DESC LIMIT 30',uid)],'activity':[record(r) for r in await c.fetch('SELECT * FROM activity WHERE user_id=$1 ORDER BY id DESC LIMIT 50',uid)],'shares':[record(r) for r in await c.fetch('SELECT * FROM shares WHERE user_id=$1 ORDER BY created_at DESC',uid)]}
+        workspace={'profile':user,'cv':await cv_data(c,uid),'score':score,'evidence':[record(r) for r in await c.fetch('SELECT * FROM evidence WHERE user_id=$1 ORDER BY created_at DESC',uid)],'documents':[record(r) for r in await c.fetch('SELECT * FROM documents WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30',uid)],'versions':[record(r) for r in await c.fetch('SELECT * FROM cv_versions WHERE user_id=$1 ORDER BY id DESC LIMIT 30',uid)],'badges':[record(r) for r in await c.fetch('SELECT id,badge_id,started_at,submitted_at,correct_count,passed,score_delta FROM attempts WHERE user_id=$1 ORDER BY started_at DESC LIMIT 50',uid)],'history':[record(r) for r in await c.fetch('SELECT * FROM score_history WHERE user_id=$1 ORDER BY id DESC LIMIT 30',uid)],'activity':[record(r) for r in await c.fetch('SELECT * FROM activity WHERE user_id=$1 ORDER BY id DESC LIMIT 50',uid)],'shares':[record(r) for r in await c.fetch('SELECT * FROM shares WHERE user_id=$1 ORDER BY created_at DESC',uid)]}
+        workspace['earned_badges']=[r['badge_id'] for r in await c.fetch('SELECT DISTINCT badge_id FROM attempts WHERE user_id=$1 AND passed=TRUE',uid)]
+        workspace['insights']=build_insights(workspace['cv'],workspace['evidence'],[{'badge_id':b,'passed':True} for b in workspace['earned_badges']],user.get('github_identity',{}),workspace['history'])
+        workspace['review_audit']=[record(r) for r in await c.fetch('SELECT * FROM review_decisions WHERE user_id=$1 ORDER BY id DESC LIMIT 100',uid)]
+        return workspace
 
 @router.patch('/me')
 async def edit_profile(payload:ProfilePatch,user=Depends(current_user)):
@@ -282,6 +290,14 @@ async def job_worker():
 async def challenges(user=Depends(current_user)):
     return [{'id':key,'name':value[0],'skill':value[1],'questions':5,'duration_seconds':300,'pass_threshold':3} for key,value in CATALOG.items()]
 
+@router.get('/challenges/{badge_id}')
+async def badge_detail(badge_id:str,user=Depends(current_user)):
+    if badge_id not in CATALOG: raise HTTPException(404,'Challenge not found')
+    async with db() as c:
+        attempts=[record(r) for r in await c.fetch('SELECT id,badge_id,started_at,submitted_at,expires_at,correct_count,passed,score_delta FROM attempts WHERE user_id=$1 AND badge_id=$2 ORDER BY started_at DESC LIMIT 100',user['id'],badge_id)]
+        earned=await c.fetchval('SELECT EXISTS(SELECT 1 FROM attempts WHERE user_id=$1 AND badge_id=$2 AND passed=TRUE)',user['id'],badge_id)
+    return {'id':badge_id,'name':CATALOG[badge_id][0],'skill':CATALOG[badge_id][1],'earned':earned,'questions':5,'pass_threshold':3,'duration_seconds':300,'attempts':attempts,'scope':'A pass covers this five-question assessment. Repeated passes add no score; failed retries preserve an earned badge.'}
+
 @router.post('/challenges/{badge_id}/attempts',status_code=201)
 async def start_attempt(badge_id:str,user=Depends(current_user)):
     if badge_id not in CATALOG: raise HTTPException(404,'Challenge not found')
@@ -326,6 +342,10 @@ async def add_evidence(payload:EvidenceInput,user=Depends(current_user)):
     if payload.kind=='coding':
         solved=payload.detail.get('solved',0)
         if type(solved) is not int or solved<0 or solved>100000: raise HTTPException(422,'Solved count must be a nonnegative integer')
+    if payload.kind=='certificate':
+        for field in ('issuer','reference','issued_on'):
+            value=payload.detail.get(field,'')
+            if not isinstance(value,str) or len(value)>300: raise HTTPException(422,'Certificate issuer/reference/date must be text of at most 300 characters')
     status='pending'
     if payload.kind=='project':
         repository=payload.detail.get('repository','')
@@ -342,6 +362,25 @@ async def add_evidence(payload:EvidenceInput,user=Depends(current_user)):
             await recalculate(c,user['id'],'Evidence added')
             await event(c,user['id'],'evidence',payload.title+' added: '+status)
     return {'id':eid,'status':status}
+
+@router.post('/coding/import',status_code=201)
+async def import_coding_profile(file:UploadFile=File(...),user=Depends(current_user)):
+    content=await file.read(65537)
+    if not content or len(content)>65536: raise HTTPException(413,'Coding profile JSON limit is 64 KB')
+    try:
+        data=json.loads(content)
+        if not isinstance(data,dict): raise ValueError()
+        source=data['source_url']; solved=data['solved']
+        if not isinstance(source,str): raise ValueError()
+        url=urlsplit(source)
+        if url.scheme!='https' or url.hostname not in ('leetcode.com','www.leetcode.com','codeforces.com','www.codeforces.com','hackerrank.com','www.hackerrank.com') or url.port not in (None,443) or url.username or url.password or url.query or url.fragment or url.path in ('','/'):
+            raise ValueError()
+        if type(solved) is not int or not 0<=solved<=100000: raise ValueError()
+    except (ValueError,TypeError,KeyError):
+        raise HTTPException(422,'Use a profile JSON with a recognized HTTPS source_url and integer solved count')
+    detail={'solved':solved,'claimed':True,'import_method':'User-supplied JSON; not a provider-verified count',
+            'import_sha256':hashlib.sha256(content).hexdigest(),'imported_at':datetime.now(timezone.utc).isoformat(),'provider':url.hostname}
+    return await add_evidence(EvidenceInput(kind='coding',title='Imported coding profile: '+url.hostname,url=source,detail=detail),user)
 
 @router.post('/evidence/{evidence_id}/file')
 async def attach_proof(evidence_id:str,file:UploadFile=File(...),user=Depends(current_user)):
@@ -376,6 +415,11 @@ async def remove_evidence(evidence_id:str,user=Depends(current_user)):
 async def reviews(user=Depends(reviewer)):
     async with db() as c: return [record(r) for r in await c.fetch("SELECT e.*,u.handle FROM evidence e JOIN users u ON u.id=e.user_id WHERE e.status='pending' ORDER BY e.created_at LIMIT 100")]
 
+@router.get('/reviews/audit')
+async def review_audit(user=Depends(reviewer)):
+    async with db() as c:
+        return [record(r) for r in await c.fetch('SELECT d.*,u.handle FROM review_decisions d JOIN users u ON u.id=d.user_id ORDER BY d.id DESC LIMIT 100')]
+
 @router.post('/reviews/{evidence_id}')
 async def review(evidence_id:str,payload:Decision,user=Depends(reviewer)):
     if payload.status not in ('verified','rejected'): raise HTTPException(422,'Choose verified or rejected')
@@ -386,6 +430,8 @@ async def review(evidence_id:str,payload:Decision,user=Depends(reviewer)):
             if row['user_id']==user['id']: raise HTTPException(403,'You cannot review your own evidence')
             if not row['storage_key'] and not row['url']: raise HTTPException(422,'Proof file or source URL required for review')
             await c.execute('UPDATE evidence SET status=$2,reviewer_id=$3,review_note=$4,updated_at=NOW() WHERE id=$1',evidence_id,payload.status,user['id'],payload.note)
+            source={'url':row['url'],'has_file':bool(row['storage_key']),'detail':decode(row['detail'])}
+            await c.execute('INSERT INTO review_decisions(evidence_id,user_id,reviewer_id,title,kind,status,note,source) VALUES($1,$2,$3,$4,$5,$6,$7,$8::jsonb)',evidence_id,row['user_id'],user['id'],row['title'],row['kind'],payload.status,payload.note,json.dumps(source))
             await recalculate(c,row['user_id'],'Evidence reviewed')
             await event(c,row['user_id'],'review',row['title']+': '+payload.status+' — '+payload.note)
     return {'ok':True}
@@ -482,7 +528,7 @@ async def shared_profile(share_id:str):
 @router.get('/candidates')
 async def candidates(q:str=Query(default='',max_length=100),min_score:float=Query(default=0,ge=0,le=10),user=Depends(current_user)):
     async with db() as c:
-        rows=await c.fetch("SELECT id FROM users WHERE discoverable=TRUE AND password_hash IS NOT NULL AND (display_name ILIKE $1 OR handle ILIKE $1 OR EXISTS (SELECT 1 FROM cv_versions v WHERE v.user_id=users.id AND (v.data->'skills')::text ILIKE $1)) ORDER BY handle LIMIT 50",'%'+q+'%')
+        rows=await c.fetch("SELECT id FROM users WHERE discoverable=TRUE AND password_hash IS NOT NULL AND (display_name ILIKE $1 OR handle ILIKE $1 OR (SELECT (v.data->'skills')::text FROM cv_versions v WHERE v.user_id=users.id ORDER BY v.id DESC LIMIT 1) ILIKE $1) ORDER BY handle LIMIT 50",'%'+q+'%')
         result=[]
         saved={r['candidate_id'] for r in await c.fetch('SELECT candidate_id FROM saved_candidates WHERE user_id=$1',user['id'])}
         for r in rows:

@@ -6,7 +6,7 @@ This guide uses disposable local accounts and labelled synthetic documents. It p
 
 The API preview is `http://localhost:8011`; the Flutter preview is `http://localhost:8041`. `/health` must return HTTP 200 with `status: ready`, `database: connected`, `schema_version: 2` and `service: auctor-api`. Development also reports `environment: development`, `storage: local-private`. Preview processes only run while this computer keeps them open. No hosting or provider rotation was performed.
 
-Verified: **13 backend tests**, including real PostgreSQL isolation, real text-PDF processing, reviewer/private-file access, account isolation, job states, versions, scoring, idempotency, discovery, exports, mocked GitHub provider boundaries, and production configuration guards. Remote CI and live OAuth are separate gates.
+Verified: **18 backend tests**, including real PostgreSQL isolation/text-PDF jobs, private-file access, ownership, versions/grading/replay, discovery/exports, provider-boundary OAuth, graph/roadmap/badge details, issuer/audit/history comparisons, bounded unverified profile imports and production guards. Remote CI/live consent remain separate gates.
 
 ## Start the API
 
@@ -45,7 +45,7 @@ Set-Location 'D:\remaining-4-git-projs\auctor\Auctor-B-end-FastAPI'
 .\.venv\Scripts\python.exe scripts/create_manual_fixtures.py
 ```
 
-The ignored `_data/manual-fixtures` directory contains a labelled text CV, labelled proof, non-PDF input, damaged input and a blank valid PDF. Nothing is uploaded or inserted automatically. Upload `synthetic-cv.pdf` through **Evidence → Upload CV** in the UI. Expected: queued/running/succeeded state, extracted skills and a revision; every extracted claim remains unverified. Exact heuristic project/experience segmentation is not guaranteed: use **Review & edit** to correct it. `invalid.pdf` must immediately return 400; blank/damaged PDFs may queue but must end `failed` with a safe message. **Retry** may fail again on the same unreadable input; it must not fabricate CV content.
+The ignored `_data/manual-fixtures` directory contains a labelled text CV/proof, non-PDF, damaged/blank PDF and coding-profile JSON. Nothing is uploaded or inserted automatically. Upload `synthetic-cv.pdf` via **Evidence → Upload CV**: queued/running/succeeded, skills and a revision; all claims remain unverified. Exact heuristic segmentation may need **Review & edit**. Invalid PDF returns 400; blank/damaged input may queue then fail safely. Retry can fail again, never fabricate data. Import `coding-profile.json` through the connected JSON picker: 150 claimed problems, pending/unverified, source/digest metadata, zero points until independent review; no provider call is made.
 
 ## API ownership checks without exposing tokens
 
@@ -104,12 +104,15 @@ Use the UI to answer **Docker** with the supplied local practice key in the Flut
 ```powershell
 Set-Location 'D:\remaining-4-git-projs\auctor\Auctor-B-end-FastAPI'
 $env:AUCTOR_TEST_LOCAL='1'
+New-Item -ItemType Directory -Force -Path '_data/qa-temp' | Out-Null
+$env:TEMP='D:\remaining-4-git-projs\auctor\Auctor-B-end-FastAPI\_data\qa-temp'
+$env:TMP=$env:TEMP
 $env:PYTHONDONTWRITEBYTECODE='1'
 # Optional AUCTOR_TEST_DSN: a private DSN to a LOCAL disposable PostgreSQL database.
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Expected: 13 passed with local PostgreSQL available. Integration tests create a random `auctor_test_*` schema and temporary private-file directory; teardown removes only that generated schema. They refuse non-local PostgreSQL hosts. Without `AUCTOR_TEST_LOCAL=1`, integration checks are skipped and a green result is not full integration verification. OAuth tests use explicit provider fixtures; no live GitHub/OpenAI calls are claimed.
+Expected: 18 passed with local PostgreSQL available. Integration tests create a random `auctor_test_*` schema and temporary private-file directory; teardown removes only that generated schema. They refuse non-local PostgreSQL hosts. Without `AUCTOR_TEST_LOCAL=1`, integration checks are skipped and a green result is not full integration verification. OAuth tests use explicit provider fixtures; no live GitHub/OpenAI calls are claimed.
 
 ## Optional gates
 

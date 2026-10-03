@@ -22,6 +22,8 @@ Use Python 3.11+ and PostgreSQL. Create a virtual environment, install `requirem
 
 Private files live under ignored `STORAGE_PATH` and are served only to the owner or reviewer. A production instance must mount a persistent private volume, use HTTPS, restrict origins and configure backups. External object storage and malware scanning are not configured here. Create the reviewer account, verify its identity out of band, then use the operator role-assignment command; never grant general users reviewer privileges.
 
+`APP_ENV=production` enforces an explicit PostgreSQL DSN, public HTTPS origins/exact CORS, matching OAuth callback and existing absolute private-volume containment/write readiness before startup. Set `PUBLIC_API_URL` and `STORAGE_VOLUME_PATH` (or Railway's supplied mount path). `railway.json` uses `/health` readiness. This validates runtime configuration, not backup completion; hosting remains deferred.
+
 ## API
 
 OpenAPI `/docs` is the current contract. Core groups: `/api/auth/*`, `/api/me`, `/api/cv`, `/api/cv/jobs`, `/api/challenges`, `/api/attempts`, `/api/evidence`, `/api/reviews`, `/api/github`, `/api/candidates`, `/api/shares`, `/api/public`, `/api/share`, `/api/export`, `/api/badge`.
@@ -33,6 +35,8 @@ Every private resource derives its owner from `Authorization: Bearer ...`; arbit
 `python -m pytest -q` runs pure domain tests. For integration verification set `AUCTOR_TEST_LOCAL=1`; tests create a random isolated schema on a local PostgreSQL DSN, then remove only that exact schema. `AUCTOR_TEST_DSN` can override the private local DSN. Non-local hosts are refused. CI uses a disposable PostgreSQL service.
 
 The test journeys cover account separation, authenticated writes, server grading and replay, actual score deltas, privacy and share revocation, invalid uploads, independent reviewer decisions, discovery, PDF reports and database readiness. Live GitHub/OpenAI verification requires operator credentials and an interactive GitHub OAuth consent flow.
+
+The current isolated local run passed **18 tests**, including graph/roadmap/history/issuer/audit/import and production guards. Integration tests use a temporary private-file directory and separate schema. See [the API manual test guide](docs/MANUAL_TESTS.md) for exact startup/fixture commands and expected ownership/grading/review/share behavior; the companion Flutter guide covers the exact approved 20 capabilities, with auth/themes as additional foundations.
 
 ## Security follow-up
 

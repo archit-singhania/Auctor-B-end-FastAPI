@@ -1,5 +1,6 @@
 """Generate labelled, synthetic PDFs for local manual QA; no database/provider calls."""
 from pathlib import Path
+import json
 
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen.canvas import Canvas
@@ -43,7 +44,8 @@ def main():
     empty = Canvas(str(output / 'blank.pdf'), pagesize=A4)
     empty.showPage()
     empty.save()
-    print('Created five synthetic local QA files under _data/manual-fixtures.')
+    (output / 'coding-profile.json').write_text(json.dumps({'source_url':'https://leetcode.com/u/synthetic-local-qa-fixture','solved':150},indent=2),encoding='utf-8')
+    print('Created five synthetic PDFs and one unverified profile JSON under _data/manual-fixtures.')
 
 
 if __name__ == '__main__':

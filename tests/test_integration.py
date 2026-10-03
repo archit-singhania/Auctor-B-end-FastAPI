@@ -39,6 +39,54 @@ def account(client,email,handle):
     assert response.status_code==201,response.text
     return {'Authorization':'Bearer '+response.json()['token']}
 
+def test_owned_insights_badge_details_certificate_issuer_and_durable_review_audit(client):
+    owner=account(client,'insight-owner@example.test','insight-owner'); other=account(client,'insight-other@example.test','insight-other')
+    reviewer=account(client,'insight-reviewer@example.test','insight-reviewer')
+    async def grant():
+        from app.platform import db
+        async with db() as c: await c.execute("UPDATE users SET role='reviewer' WHERE email='insight-reviewer@example.test'")
+    client.portal.call(grant)
+    cv={'skills':['Docker','PostgreSQL','Unknown Tool'],'projects':[{'name':'Insight API','tech_stack':['Docker']}],'experience':[],'profiles':{}}
+    assert client.put('/api/cv',headers=owner,json={'data':cv}).status_code==200
+    aid=client.post('/api/challenges/docker/attempts',headers=owner).json()['id']
+    assert client.post('/api/attempts/'+aid+'/submit',headers=owner,json={'answers':{str(i):q[2] for i,q in enumerate(CATALOG['docker'][2])}}).status_code==200
+    detail=client.get('/api/challenges/docker',headers=owner).json()
+    assert detail['earned'] and len(detail['attempts'])==1 and 'answers' not in detail['attempts'][0]
+    assert client.get('/api/challenges/docker',headers=other).json()['attempts']==[]
+    certificate=client.post('/api/evidence',headers=owner,json={'kind':'certificate','title':'Synthetic certificate','url':'https://example.test/certificate','detail':{'issuer':'Synthetic issuer','reference':'QA-123','issued_on':'2026-10-01'}}).json()['id']
+    assert client.post('/api/reviews/'+certificate,headers=reviewer,json={'status':'verified','note':'Inspected issuer/source for synthetic workflow testing'}).status_code==200
+    state=client.get('/api/me',headers=owner).json()
+    nodes={n['name']:n for n in state['insights']['skill_graph']['nodes']}
+    assert nodes['Docker']['status']=='assessed' and nodes['PostgreSQL']['status']=='claimed'
+    assert state['review_audit'][0]['source']['detail']['issuer']=='Synthetic issuer'
+    assert client.patch('/api/me',headers=owner,json={'display_name':'Insight owner','discoverable':True}).status_code==200
+    assert len(client.get('/api/candidates?q=Unknown%20Tool',headers=other).json())==1
+    cv['skills']=['Docker','PostgreSQL']
+    assert client.put('/api/cv',headers=owner,json={'data':cv}).status_code==200
+    assert client.get('/api/candidates?q=Unknown%20Tool',headers=other).json()==[]
+    assert any('pending → verified' in change for item in state['insights']['score_comparisons'] for change in item['changes'])
+    assert client.get('/api/me',headers=other).json()['review_audit']==[]
+    assert client.get('/api/reviews/audit',headers=other).status_code==403
+    assert any(row['evidence_id']==certificate for row in client.get('/api/reviews/audit',headers=reviewer).json())
+    assert client.delete('/api/evidence/'+certificate,headers=owner).status_code==200
+    assert client.get('/api/me',headers=owner).json()['review_audit'][0]['evidence_id']==certificate
+    assert client.get('/api/me',headers=owner).json()['score']['total']==.6
+
+def test_profile_json_import_is_bounded_owned_and_honestly_unverified(client):
+    import json
+    owner=account(client,'import-owner@example.test','import-owner');other=account(client,'import-other@example.test','import-other')
+    payload=json.dumps({'source_url':'https://leetcode.com/u/synthetic-local-qa','solved':150}).encode()
+    result=client.post('/api/coding/import',headers=owner,files={'file':('profile.json',payload,'application/json')})
+    assert result.status_code==201 and result.json()['status']=='pending'
+    state=client.get('/api/me',headers=owner).json()
+    assert state['score']['total']==0
+    assert state['evidence'][0]['detail']['solved']==150 and 'not a provider-verified' in state['evidence'][0]['detail']['import_method']
+    assert len(state['evidence'][0]['detail']['import_sha256'])==64
+    assert client.get('/api/me',headers=other).json()['evidence']==[]
+    assert client.post('/api/coding/import',headers=owner,files={'file':('bad.json',b'{','application/json')}).status_code==422
+    assert client.post('/api/coding/import',headers=owner,files={'file':('large.json',b'x'*65537,'application/json')}).status_code==413
+    assert client.post('/api/coding/import',headers=owner,files={'file':('source.json',json.dumps({'source_url':'https://private.example.test/profile','solved':10}).encode(),'application/json')}).status_code==422
+
 def test_owned_workflows_and_idempotent_grading(client):
     one=account(client,'one@example.test','developer-one');two=account(client,'two@example.test','developer-two')
     assert client.get('/api/me').status_code==401
