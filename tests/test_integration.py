@@ -237,9 +237,12 @@ def test_revision_proof_review_recruiter_and_account_lifecycle(client):
         assert client.post('/api/evidence/'+eid+'/file',headers=owner,files={'file':('changed.pdf',proof,'application/pdf')}).status_code==409
         assert client.delete('/api/evidence/'+eid,headers=reader).status_code==404
     assert client.get('/api/me',headers=owner).json()['score']['total']==1.5
-    prefs={'theme':'dark','reduced_motion':True,'reduced_transparency':True}
+    prefs={'theme':'dark','reduced_motion':True,'reduced_transparency':True,'high_contrast':True}
     assert client.patch('/api/me',headers=owner,json={'display_name':'Lifecycle Developer','discoverable':True,'preferences':prefs}).status_code==200
     assert client.get('/api/me',headers=owner).json()['profile']['preferences']==prefs
+    assert client.patch('/api/me',headers=owner,json={'display_name':'Lifecycle Developer','preferences':{'high_contrast':'true'}}).status_code==422
+    assert client.patch('/api/me',headers=owner,json={'display_name':'Lifecycle Developer','preferences':{'theme':'unknown'}}).status_code==422
+    assert client.patch('/api/me',headers=owner,json={'display_name':'Lifecycle Developer','preferences':{'oversized':'x'*4097}}).status_code==422
     assert client.post(f'/api/candidates/{uid}/save',headers=reader).status_code==200
     assert client.get('/api/candidates?q=lifecycle-developer',headers=reader).json()[0]['saved'] is True
     assert client.get('/api/candidates?q=lifecycle-developer',headers=reviewer).json()[0]['saved'] is False

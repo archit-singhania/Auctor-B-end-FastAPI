@@ -182,6 +182,10 @@ async def me(user=Depends(current_user)):
 @router.patch('/me')
 async def edit_profile(payload:ProfilePatch,user=Depends(current_user)):
     if payload.preferences.get('theme','system') not in ('system','light','dark'): raise HTTPException(422,'Unknown theme')
+    if len(json.dumps(payload.preferences))>4096: raise HTTPException(422,'Appearance preferences are too large')
+    for key in ('reduced_motion','reduced_transparency','high_contrast'):
+        if key in payload.preferences and type(payload.preferences[key]) is not bool:
+            raise HTTPException(422,'Accessibility preferences must be true or false')
     async with db() as c:
         await c.execute('UPDATE users SET display_name=$2,bio=$3,discoverable=$4,preferences=$5::jsonb WHERE id=$1',user['id'],payload.display_name,payload.bio,payload.discoverable,json.dumps(payload.preferences))
     return {'ok':True}
