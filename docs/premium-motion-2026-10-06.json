@@ -1,0 +1,41 @@
+{
+  "scope": "Auctor API presentation and confirmed-result contract",
+  "checked_at_utc": "2026-10-06T12:19:41.455657+00:00",
+  "checks": {
+    "isolated_postgresql_tests": 18,
+    "seconds": 16.94,
+    "pdf_svg_endpoints": "passed in integration suite",
+    "preferences": "existing bounded JSON contract; all three palettes have actual browser/server readback"
+  },
+  "source_unchanged": true,
+  "artifacts": [
+    {
+      "path": "app/evidence_report.py",
+      "bytes": 4183,
+      "sha256": "e8035cbb20a898895426162b91d919df8d07e40b0b9bec1090bf9f55e9809b6b"
+    },
+    {
+      "path": "app/platform.py",
+      "bytes": 38586,
+      "sha256": "0d3f54b3ffadbd7d923a9ddfabdab55c2a460975ea26b22f545135494edbb2fe"
+    },
+    {
+      "path": "app/domain.py",
+      "bytes": 6097,
+      "sha256": "841fd147a92aee93f6c9022516c0266900eab9777b95d53b7c15038bcc38fa33"
+    }
+  ],
+  "canonical_palette": {
+    "jade": "#275d57",
+    "paper": "#fffcf6",
+    "graphite": "#20282e",
+    "champagne": "#d8bd8a"
+  },
+  "companion_receipt": "../Auctor-F-end-Flutter/docs/premium-motion-2026-10-06.json",
+  "manual_gates": [
+    "Native emulator/device execution",
+    "iOS/macOS signing",
+    "Live provider consent",
+    "Public hosting"
+  ]
+}
