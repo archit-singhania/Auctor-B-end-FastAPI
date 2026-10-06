@@ -18,7 +18,7 @@ Use Python 3.11+ and PostgreSQL. Create a virtual environment, install `requirem
 6. Five server-managed assessment tracks with timed owned attempts, server grading and idempotent submission. Answers are not sent with question prompts. Repeated passes do not inflate score; later failed attempts preserve earlier achievements.
 7. Independent reviewers inspect private proof files or sources and record a reason. Self-review is forbidden.
 8. Explainable score v1 preserves weights: GitHub 25%, coding 15%, badges 30%, project evidence 15%, experience 15%. Coding uses independently reviewed counts divided by 300; certificates are visible proof but do not add v1 points.
-9. Activity/read status, score history, opt-in candidate search/filter/save/compare, private revocable shares, contact-redacted public profiles, JSON/PDF reports and public SVG embed badges.
+9. Activity/read status, score history, opt-in candidate search/filter/save/compare, private revocable shares, contact-redacted public profiles, JSON/PDF reports and public SVG embed badges. PDF exports use an ivory/jade editorial layout with a score card, flowing evidence and page numbering; SVG badges match the Flutter graphite/champagne identity and accommodate long handles.
 
 Private files live under ignored `STORAGE_PATH` and are served only to the owner or reviewer. A production instance must mount a persistent private volume, use HTTPS, restrict origins and configure backups. External object storage and malware scanning are not configured here. Create the reviewer account, verify its identity out of band, then use the operator role-assignment command; never grant general users reviewer privileges.
 

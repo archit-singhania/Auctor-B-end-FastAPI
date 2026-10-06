@@ -3,7 +3,6 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import html
-import io
 import json
 from pathlib import Path
 import secrets
@@ -560,24 +559,15 @@ async def export(format:str='json',user=Depends(current_user)):
         from fastapi.encoders import jsonable_encoder
         return Response(json.dumps(jsonable_encoder(data),indent=2),media_type='application/json',headers={'Content-Disposition':'attachment; filename="auctor-evidence.json"'})
     if format!='pdf': raise HTTPException(422,'Choose json or pdf')
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
-    buffer=io.BytesIO(); pdf=canvas.Canvas(buffer,pagesize=A4); y=790
-    lines=['AUCTOR | EVIDENCE REPORT',user['display_name']+' @'+user['handle'],f"Score {data['score']['total']}/10 | Formula v1",'Evidence reflects sources and reviewer decisions, not a hiring guarantee.','', 'Skills: '+', '.join(data['skills']), '', 'Evidence:']
-    lines.extend(e['kind']+': '+e['title']+' | '+e['status'] for e in data['evidence'])
-    lines.extend('Badge: '+b for b in data['badges'])
-    import textwrap
-    for line in lines:
-        for chunk in textwrap.wrap(line,90) or ['']:
-            if y<50: pdf.showPage(); y=790
-            pdf.setFont('Helvetica',10); pdf.drawString(42,y,chunk); y-=18
-    pdf.save()
-    return Response(buffer.getvalue(),media_type='application/pdf',headers={'Content-Disposition':'attachment; filename="auctor-evidence.pdf"'})
+    from app.evidence_report import evidence_pdf
+    return Response(evidence_pdf(data,user),media_type='application/pdf',headers={'Content-Disposition':'attachment; filename="auctor-evidence.pdf"'})
 
 @router.get('/badge/{handle}.svg')
 async def embed_badge(handle:str):
     data=await public_profile(handle)
-    label=html.escape(f"{handle} · {data['score']['total']}/10")
-    svg=f'<svg xmlns="http://www.w3.org/2000/svg" width="320" height="42" role="img" aria-label="Auctor evidence score"><rect width="320" height="42" rx="12" fill="#19211f"/><text x="18" y="27" font-family="sans-serif" font-size="14" fill="#efd6a2">AUCTOR</text><text x="110" y="27" font-family="sans-serif" font-size="13" fill="white">{label}</text></svg>'
+    plain_label=f"{handle} · {data['score']['total']}/10"
+    label=html.escape(plain_label)
+    width=max(360,145+len(plain_label)*10)
+    svg=f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="46" role="img" aria-label="Auctor evidence score"><defs><linearGradient id="g" x2="1" y2="1"><stop stop-color="#263c3c"/><stop offset="1" stop-color="#20282e"/></linearGradient></defs><rect x=".5" y=".5" width="{width-1}" height="45" rx="13" fill="url(#g)" stroke="#657c75"/><path d="M104 10v26" stroke="#657c75"/><text x="18" y="29" font-family="Inter,system-ui,sans-serif" font-size="12" font-weight="600" letter-spacing="1.2" fill="#d8bd8a">AUCTOR</text><text x="121" y="29" font-family="Inter,system-ui,sans-serif" font-size="12" fill="#f3f0e7">{label}</text></svg>'
     return Response(svg,media_type='image/svg+xml',headers={'Cache-Control':'public,max-age=60'})
 
