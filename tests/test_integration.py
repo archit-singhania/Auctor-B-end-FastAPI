@@ -146,7 +146,7 @@ def test_reviewer_and_discovery_privacy(client):
     assert len(listed.json())==1
     assert client.get('/api/export?format=pdf',headers=dev).content.startswith(b'%PDF-')
     assert client.get('/api/badge/proof-developer.svg').status_code==200
-    assert client.get('/health').json()['schema_version']==2
+    assert client.get('/health').json()['schema_version']==5
 
 def test_oauth_ownership_and_project_binding(client,monkeypatch):
     import httpx
@@ -260,3 +260,138 @@ def test_revision_proof_review_recruiter_and_account_lifecycle(client):
     assert client.get('/api/me',headers=owner).json()['score']['total']==0
     assert client.post('/api/auth/logout',headers=owner).status_code==200
     assert client.get('/api/me',headers=owner).status_code==401
+
+
+def test_career_story_owned_revisions_public_redaction_and_reordering(client):
+    owner=account(client,'career-owner@example.test','career-owner')
+    other=account(client,'career-other@example.test','career-other')
+    evidence=client.post('/api/evidence',headers=owner,json={'kind':'certificate','title':'Career source','detail':{'issuer':'Illustrative issuer'}}).json()['id']
+    foreign=client.post('/api/evidence',headers=other,json={'kind':'certificate','title':'Private other source'}).json()['id']
+    milestone={'id':'first','title':'Built a service','date':'2026-01-01','kind':'project','narrative':'Candidate description','annotation':'First release','visible':True,'evidence_ids':[evidence]}
+    initial=client.get('/api/career-story',headers=owner).json();assert initial=={'revision':0,'milestones':[]}
+    invalid=client.put('/api/career-story',headers=owner,json={'revision':0,'milestones':[{**milestone,'evidence_ids':[foreign]}]});assert invalid.status_code==404
+    saved=client.put('/api/career-story',headers=owner,json={'revision':0,'milestones':[milestone,{**milestone,'id':'private','visible':False,'title':'Private milestone'}]});assert saved.status_code==200,saved.text
+    assert client.get('/api/career-story',headers=other).json()['milestones']==[]
+    assert client.put('/api/career-story',headers=owner,json={'revision':0,'milestones':[]}).status_code==409
+    share=client.post('/api/shares',headers=owner).json()['id']
+    public=client.get('/api/share/'+share).json()['career_story']['milestones']
+    assert len(public)==1 and not public[0]['evidence'] and 'Candidate-written' in public[0]['narrative_status']
+    async def verify():
+        from app.platform import db
+        async with db() as c: await c.execute("UPDATE evidence SET status='verified' WHERE id=$1",evidence)
+    client.portal.call(verify)
+    public=client.get('/api/share/'+share).json()['career_story']['milestones'];assert public[0]['evidence'][0]['id']==evidence
+    assert 'detail' not in public[0]['evidence'][0] and 'evidence_ids' not in public[0]
+    reversed_items=list(reversed(saved.json()['milestones']))
+    result=client.put('/api/career-story',headers=owner,json={'revision':1,'milestones':reversed_items});assert result.status_code==200
+    assert client.get('/api/me',headers=owner).json()['career_story']['milestones'][0]['id']=='private'
+    assert client.put('/api/career-story',headers=owner,json={'revision':2,'milestones':[milestone,milestone]}).status_code==422
+    assert client.put('/api/career-story',headers=owner,json={'revision':2,'milestones':[{**milestone,'date':'2026-02-30'}]}).status_code==422
+    client.delete('/api/shares/'+share,headers=owner);assert client.get('/api/share/'+share).status_code==404
+
+
+def test_role_fit_review_weights_ownership_reproducibility_and_score_separation(client):
+    owner=account(client,'role-owner@example.test','role-owner');other=account(client,'role-other@example.test','role-other')
+    assert client.post('/api/role-fit/runs',headers=owner).status_code==400
+    payload={'revision':0,'title':'Platform engineer','description':'Docker and PostgreSQL','reviewed':True,'requirements':[{'skill':'Docker','priority':'required'},{'skill':'PostgreSQL','priority':'preferred'}]}
+    assert client.put('/api/role-fit',headers=owner,json=payload).status_code==200
+    assert client.put('/api/role-fit',headers=owner,json=payload).status_code==409
+    before=client.get('/api/me',headers=owner).json()['score']
+    first=client.post('/api/role-fit/runs',headers=owner).json();second=client.post('/api/role-fit/runs',headers=owner).json()
+    assert first['result']['input_sha256']==second['result']['input_sha256']
+    assert first['result']['total_weight']==3 and first['result']['coverage_percent']==0
+    assert all(r['status']=='unknown' for r in first['result']['contributions'])
+    assert client.get('/api/role-fit',headers=other).json()['runs']==[]
+    assert client.get('/api/me',headers=owner).json()['score']==before
+    invalid={**payload,'revision':1,'requirements':[{'skill':'Postgres'},{'skill':'PostgreSQL'}]}
+    assert client.put('/api/role-fit',headers=owner,json=invalid).status_code==422
+
+
+def test_snapshot_comparison_annotations_pdf_and_owned_practice(client,monkeypatch):
+    import time,io
+    from reportlab.pdfgen.canvas import Canvas
+    owner=account(client,'workbench-owner@example.test','workbench-owner');other=account(client,'workbench-other@example.test','workbench-other')
+    from app.config import settings
+    monkeypatch.setattr(settings,'openai_api_key','')
+    for skill in ['Docker','PostgreSQL']:
+        assert client.put('/api/cv',headers=owner,json={'data':{'skills':[skill],'projects':[],'experience':[],'profiles':{}}}).status_code==200
+    versions=client.get('/api/me',headers=owner).json()['versions'];ids=[]
+    def ready(sid):
+        for _ in range(100):
+            item=next(s for s in client.get('/api/workbench/snapshots',headers=owner).json() if s['id']==sid)
+            if item['status'] in ('ready','failed','cancelled'):return item
+            time.sleep(.05)
+        raise AssertionError('Snapshot worker timed out')
+    for version in versions:
+        result=client.post('/api/workbench/snapshots',headers=owner,json={'kind':'cv_version','source_id':str(version['id'])});assert result.status_code==202,result.text
+        sid=result.json()['id'];assert ready(sid)['status']=='ready';ids.append(sid)
+    assert client.post('/api/workbench/snapshots',headers=other,json={'kind':'cv_version','source_id':str(versions[0]['id'])}).status_code==404
+    assert client.get('/api/workbench/snapshots',headers=other).json()==[]
+    comparison=client.post('/api/workbench/comparisons',headers=owner,json={'left_id':ids[0],'right_id':ids[1]});assert comparison.status_code==201,comparison.text
+    cid=comparison.json()['id'];assert client.get('/api/workbench/comparisons/'+cid,headers=other).status_code==404
+    assert client.get('/api/workbench/snapshots/'+ids[0],headers=other).status_code==404
+    listed=client.get('/api/workbench/comparisons',headers=owner).json()[0];assert any(op[0]!='equal' for op in listed['data']['operations'])
+    note={'revision':0,'annotations':[{'side':'left','line':1,'text':'Claim revision changed'}]}
+    assert client.put('/api/workbench/comparisons/'+cid+'/annotations',headers=other,json=note).status_code==404
+    assert client.put('/api/workbench/comparisons/'+cid+'/annotations',headers=owner,json=note).status_code==200
+    assert client.put('/api/workbench/comparisons/'+cid+'/annotations',headers=owner,json=note).status_code==409
+    assert client.put('/api/workbench/comparisons/'+cid+'/annotations',headers=owner,json={'revision':1,'annotations':[{'side':'right','line':1999,'text':'Out of range'}]}).status_code==422
+    buffer=io.BytesIO();pdf=Canvas(buffer);pdf.drawString(60,750,'Original PDF text Docker 2026');pdf.save();pdfbytes=buffer.getvalue()
+    upload=client.post('/api/cv/jobs',headers=owner,files={'file':('Comparison.pdf',pdfbytes,'application/pdf')});assert upload.status_code==202
+    job=upload.json()['id']
+    for _ in range(100):
+        if client.get('/api/cv/jobs/'+job,headers=owner).json()['status']=='succeeded':break
+        time.sleep(.05)
+    version=client.get('/api/me',headers=owner).json()['versions'][0]
+    pdfsnapshot=client.post('/api/workbench/snapshots',headers=owner,json={'kind':'cv_version','source_id':str(version['id'])}).json()['id']
+    actual=ready(pdfsnapshot);assert actual['status']=='ready',actual
+    assert 'Original PDF text Docker 2026' in actual['data']['text'] and 'file_sha256' in actual['data']
+    assert client.get('/api/cv/jobs/'+job+'/file',headers=owner).content==pdfbytes
+    assert client.get('/api/cv/jobs/'+job+'/file',headers=other).status_code==404
+    evidence=client.post('/api/evidence',headers=owner,json={'kind':'certificate','title':'Practice context'}).json()['id']
+    assert client.post('/api/workbench/practice',headers=owner,json={'role_revision':0,'requirement_indexes':[0]}).status_code==400
+    role={'revision':0,'title':'Engineer','description':'Docker','reviewed':True,'requirements':[{'skill':'Docker'}]}
+    assert client.put('/api/role-fit',headers=owner,json=role).status_code==200
+    assert client.post('/api/workbench/practice',headers=other,json={'role_revision':0,'requirement_indexes':[0],'evidence_ids':[evidence]}).status_code==400
+    practice=client.post('/api/workbench/practice',headers=owner,json={'role_revision':1,'requirement_indexes':[0],'evidence_ids':[evidence],'duration_seconds':60});assert practice.status_code==201,practice.text
+    sid=practice.json()['id'];assert client.get('/api/workbench/practice/'+sid,headers=other).status_code==404
+    assert client.post('/api/workbench/practice',headers=owner,json={'role_revision':0,'requirement_indexes':[0]}).status_code==409
+    before=client.get('/api/me',headers=owner).json()['score']
+    patch={'revision':0,'answers':{'0':'I reduced failures by 20 percent using measured container tests.'},'review':{'0':{'situation':True,'outcome':True}}}
+    assert client.put('/api/workbench/practice/'+sid,headers=other,json=patch).status_code==404
+    saved=client.put('/api/workbench/practice/'+sid,headers=owner,json=patch);assert saved.status_code==200,saved.text
+    assert saved.json()['feedback']['items'][0]['has_numeric_detail'] is True
+    assert client.put('/api/workbench/practice/'+sid,headers=owner,json=patch).status_code==409
+    assert client.put('/api/workbench/practice/'+sid,headers=owner,json={**patch,'revision':1,'finish':True}).status_code==200
+    assert client.put('/api/workbench/practice/'+sid,headers=owner,json={**patch,'revision':2}).status_code==409
+    current=client.get('/api/workbench/practice',headers=owner).json()['sessions'][0]
+    assert current['status']=='completed' and current['answers']['0']==patch['answers']['0'] and current['source']['evidence'][0]['id']==evidence
+    assert client.get('/api/workbench/practice',headers=other).json()['sessions']==[]
+    assert client.get('/api/me',headers=owner).json()['score']==before
+
+
+def test_snapshot_cancel_retry_and_cached_repository_freeze(client,monkeypatch):
+    import threading,time,json
+    import app.workbench as workbench
+    owner=account(client,'snapshot-state@example.test','snapshot-state')
+    uid=client.get('/api/me',headers=owner).json()['profile']['id']
+    async def repository(description):
+        from app.platform import db
+        async with db() as c: await c.execute('UPDATE users SET github_identity=$2::jsonb WHERE id=$1',uid,json.dumps({'repositories':[{'full_name':'qa/service','description':description}],'synced_at':'2026-10-15T00:00:00Z'}))
+    client.portal.call(repository,'Original cached description')
+    started=threading.Event();release=threading.Event();original=workbench.snapshot_text
+    def controlled(source,content=None):
+        started.set();release.wait(5);return original(source,content)
+    monkeypatch.setattr(workbench,'snapshot_text',controlled)
+    sid=client.post('/api/workbench/snapshots',headers=owner,json={'kind':'repository','source_id':'qa/service'}).json()['id']
+    assert started.wait(3)
+    assert client.post('/api/workbench/snapshots/'+sid+'/cancel',headers=owner).status_code==200
+    release.set();time.sleep(.2)
+    current=next(r for r in client.get('/api/workbench/snapshots',headers=owner).json() if r['id']==sid);assert current['status']=='cancelled'
+    client.portal.call(repository,'Changed later cached description')
+    assert client.post('/api/workbench/snapshots/'+sid+'/retry',headers=owner).status_code==200
+    for _ in range(100):
+        current=next(r for r in client.get('/api/workbench/snapshots',headers=owner).json() if r['id']==sid)
+        if current['status']=='ready':break
+        time.sleep(.05)
+    assert current['status']=='ready' and 'Original cached description' in current['data']['text'] and 'Changed later' not in current['data']['text']

@@ -174,6 +174,8 @@ async def me(user=Depends(current_user)):
         score=await recalculate(c,uid,'Workspace refreshed')
         workspace={'profile':user,'cv':await cv_data(c,uid),'score':score,'evidence':[record(r) for r in await c.fetch('SELECT * FROM evidence WHERE user_id=$1 ORDER BY created_at DESC',uid)],'documents':[record(r) for r in await c.fetch('SELECT * FROM documents WHERE user_id=$1 ORDER BY created_at DESC LIMIT 30',uid)],'versions':[record(r) for r in await c.fetch('SELECT * FROM cv_versions WHERE user_id=$1 ORDER BY id DESC LIMIT 30',uid)],'badges':[record(r) for r in await c.fetch('SELECT id,badge_id,started_at,submitted_at,correct_count,passed,score_delta FROM attempts WHERE user_id=$1 ORDER BY started_at DESC LIMIT 50',uid)],'history':[record(r) for r in await c.fetch('SELECT * FROM score_history WHERE user_id=$1 ORDER BY id DESC LIMIT 30',uid)],'activity':[record(r) for r in await c.fetch('SELECT * FROM activity WHERE user_id=$1 ORDER BY id DESC LIMIT 50',uid)],'shares':[record(r) for r in await c.fetch('SELECT * FROM shares WHERE user_id=$1 ORDER BY created_at DESC',uid)]}
         workspace['earned_badges']=[r['badge_id'] for r in await c.fetch('SELECT DISTINCT badge_id FROM attempts WHERE user_id=$1 AND passed=TRUE',uid)]
+        from app.career import read_story
+        workspace['career_story']=await read_story(c,uid)
         workspace['insights']=build_insights(workspace['cv'],workspace['evidence'],[{'badge_id':b,'passed':True} for b in workspace['earned_badges']],user.get('github_identity',{}),workspace['history'])
         workspace['review_audit']=[record(r) for r in await c.fetch('SELECT * FROM review_decisions WHERE user_id=$1 ORDER BY id DESC LIMIT 100',uid)]
         return workspace
@@ -512,7 +514,8 @@ async def public_data(c,uid):
     data=await cv_data(c,uid)
     evidence=[record(r) for r in await c.fetch("SELECT id,kind,title,url,detail,status,review_note,updated_at FROM evidence WHERE user_id=$1 AND status='verified'",uid)]
     # Private contact information and proof documents never enter public payloads.
-    return {'profile':dict(profile),'skills':data.get('skills',[]),'projects':data.get('projects',[]),'score':await recalculate(c,uid,'Public profile refreshed'),'evidence':evidence,'badges':[r['badge_id'] for r in await c.fetch('SELECT DISTINCT badge_id FROM attempts WHERE user_id=$1 AND passed=TRUE',uid)]}
+    from app.career import public_story
+    return {'career_story':await public_story(c,uid),'profile':dict(profile),'skills':data.get('skills',[]),'projects':data.get('projects',[]),'score':await recalculate(c,uid,'Public profile refreshed'),'evidence':evidence,'badges':[r['badge_id'] for r in await c.fetch('SELECT DISTINCT badge_id FROM attempts WHERE user_id=$1 AND passed=TRUE',uid)]}
 
 @router.get('/public/{handle}')
 async def public_profile(handle:str):

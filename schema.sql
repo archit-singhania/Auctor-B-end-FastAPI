@@ -131,3 +131,18 @@ CREATE TABLE IF NOT EXISTS auctor.oauth_states (state_hash TEXT PRIMARY KEY, use
 CREATE TABLE IF NOT EXISTS auctor.schema_versions (version INT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 ALTER TABLE auctor.documents ADD COLUMN IF NOT EXISTS run_token TEXT;
 INSERT INTO auctor.schema_versions(version) VALUES (2) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.career_stories (user_id INT PRIMARY KEY REFERENCES auctor.users(id) ON DELETE CASCADE, revision INT NOT NULL DEFAULT 1, milestones JSONB NOT NULL DEFAULT '[]', updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+INSERT INTO auctor.schema_versions(version) VALUES (3) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.role_documents (user_id INT PRIMARY KEY REFERENCES auctor.users(id) ON DELETE CASCADE, revision INT NOT NULL, data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS auctor.role_fit_runs (id TEXT PRIMARY KEY, user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE, result JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE INDEX IF NOT EXISTS role_runs_owner_idx ON auctor.role_fit_runs(user_id,created_at DESC);
+INSERT INTO auctor.schema_versions(version) VALUES (4) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.evidence_snapshots (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,kind TEXT NOT NULL,source_id TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',data JSONB NOT NULL,error TEXT,run_token TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE INDEX IF NOT EXISTS snapshot_owner_idx ON auctor.evidence_snapshots(user_id,created_at DESC);
+CREATE TABLE IF NOT EXISTS auctor.evidence_comparisons (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,left_id TEXT NOT NULL REFERENCES auctor.evidence_snapshots(id),right_id TEXT NOT NULL REFERENCES auctor.evidence_snapshots(id),revision INT NOT NULL DEFAULT 0,data JSONB NOT NULL,annotations JSONB NOT NULL DEFAULT '[]',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS auctor.practice_sessions (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,revision INT NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'active',questions JSONB NOT NULL,source JSONB NOT NULL,answers JSONB NOT NULL DEFAULT '{}',review JSONB NOT NULL DEFAULT '{}',feedback JSONB NOT NULL DEFAULT '{}',started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),expires_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE INDEX IF NOT EXISTS practice_owner_idx ON auctor.practice_sessions(user_id,started_at DESC);
+INSERT INTO auctor.schema_versions(version) VALUES (5) ON CONFLICT DO NOTHING;

@@ -16,11 +16,15 @@ async def lifespan(app):
     score_from([],[],[],{k:getattr(settings,'weight_'+k) for k in WEIGHTS})
     await create_pool()
     worker=asyncio.create_task(job_worker())
+    from app.workbench import snapshot_worker
+    evidence_worker=asyncio.create_task(snapshot_worker())
     try:
         yield
     finally:
         worker.cancel()
+        evidence_worker.cancel()
         with suppress(asyncio.CancelledError): await worker
+        with suppress(asyncio.CancelledError): await evidence_worker
         await close_pool()
 
 app=FastAPI(title='Auctor evidence platform',version='2.0.0',lifespan=lifespan,description='Owned CV evidence, server-graded skill challenges and explainable provenance.')
@@ -35,6 +39,12 @@ async def security_headers(request:Request,call_next):
     return response
 
 app.include_router(router)
+from app.career import router as career_router
+app.include_router(career_router)
+from app.role_fit import router as role_router
+app.include_router(role_router)
+from app.workbench import router as workbench_router
+app.include_router(workbench_router)
 @app.get('/health')
 async def health():
     c=await get_conn()
