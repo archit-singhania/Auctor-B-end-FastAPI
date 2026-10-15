@@ -18,13 +18,21 @@ async def lifespan(app):
     worker=asyncio.create_task(job_worker())
     from app.workbench import snapshot_worker
     evidence_worker=asyncio.create_task(snapshot_worker())
+    from app.verification import lifecycle_worker
+    verification_worker=asyncio.create_task(lifecycle_worker())
+    from app.integrations import outbox_worker
+    integration_worker=asyncio.create_task(outbox_worker())
     try:
         yield
     finally:
         worker.cancel()
         evidence_worker.cancel()
+        verification_worker.cancel()
+        integration_worker.cancel()
         with suppress(asyncio.CancelledError): await worker
         with suppress(asyncio.CancelledError): await evidence_worker
+        with suppress(asyncio.CancelledError): await verification_worker
+        with suppress(asyncio.CancelledError): await integration_worker
         await close_pool()
 
 app=FastAPI(title='Auctor evidence platform',version='2.0.0',lifespan=lifespan,description='Owned CV evidence, server-graded skill challenges and explainable provenance.')
@@ -45,6 +53,12 @@ from app.role_fit import router as role_router
 app.include_router(role_router)
 from app.workbench import router as workbench_router
 app.include_router(workbench_router)
+from app.presentations import router as presentation_router
+app.include_router(presentation_router)
+from app.verification import router as verification_router
+app.include_router(verification_router)
+from app.integrations import router as integration_router
+app.include_router(integration_router)
 @app.get('/health')
 async def health():
     c=await get_conn()

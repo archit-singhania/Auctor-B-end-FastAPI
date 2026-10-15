@@ -73,6 +73,7 @@ class Settings(BaseSettings):
     reviewer_emails: str = ""
     storage_path: str = "_data"
     app_env: str = "development"
+    webhook_development_mode: bool = False
     public_api_url: str = ""
     # Configure a mounted private volume. Railway supplies its mount path at runtime.
     storage_volume_path: str = ""

@@ -42,7 +42,7 @@ async def snapshot(body:SnapshotInput,user=Depends(current_user)):
             found=await c.fetchrow('SELECT id,document_id,data,note,created_at FROM cv_versions WHERE id=$1 AND user_id=$2',int(body.source_id),user['id'])
             if found:source={**dict(found),'data':decode(found['data'])}
         elif body.kind=='evidence':
-            found=await c.fetchrow('SELECT id,kind,title,url,detail,status,review_note,updated_at FROM evidence WHERE id=$1 AND user_id=$2',body.source_id,user['id'])
+            found=await c.fetchrow('SELECT id,kind,title,url,detail,status,review_note,updated_at,eligibility_state,review_due_at FROM evidence WHERE id=$1 AND user_id=$2',body.source_id,user['id'])
             if found:source={**dict(found),'detail':decode(found['detail'])}
         else:
             identity=decode(await c.fetchval('SELECT github_identity FROM users WHERE id=$1',user['id'])) or {}

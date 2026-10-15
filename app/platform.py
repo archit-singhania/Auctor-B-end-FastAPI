@@ -20,6 +20,7 @@ from app.db import get_conn, release_conn
 from app.domain import CATALOG, check_password, grade, hash_password, public_question, score_from, token_hash
 from app.services.cv_parser import CvParserService
 from app.insights import build_insights, signal_snapshot
+from app.eligibility import eligible
 
 router = APIRouter(prefix='/api')
 LIMITS={}
@@ -58,6 +59,8 @@ async def reviewer(user=Depends(current_user)):
 
 async def event(c,uid,kind,message):
     await c.execute('INSERT INTO activity(user_id,kind,message) VALUES($1,$2,$3)',uid,kind,message)
+    from app.integrations import enqueue
+    await enqueue(c,uid,kind)
 
 async def cv_data(c,uid):
     row=await c.fetchrow('SELECT data FROM cv_versions WHERE user_id=$1 ORDER BY id DESC LIMIT 1',uid)
@@ -68,7 +71,7 @@ async def recalculate(c,uid,reason):
     badges=[r['badge_id'] for r in await c.fetch('SELECT DISTINCT badge_id FROM attempts WHERE user_id=$1 AND passed=TRUE',uid)]
     data=await cv_data(c,uid)
     weights={k:getattr(settings,'weight_'+k) for k in ('github','leetcode','badges','projects','experience')}
-    score=score_from(evidence,badges,data.get('projects',[]),weights)
+    score=score_from([e for e in evidence if eligible(e)],badges,data.get('projects',[]),weights)
     signals=signal_snapshot(data,evidence,badges)
     last=await c.fetchrow('SELECT score,signals FROM score_history WHERE user_id=$1 ORDER BY id DESC LIMIT 1',uid)
     if last is None or decode(last['score'])!=score or decode(last['signals'])!=signals:
@@ -176,7 +179,7 @@ async def me(user=Depends(current_user)):
         workspace['earned_badges']=[r['badge_id'] for r in await c.fetch('SELECT DISTINCT badge_id FROM attempts WHERE user_id=$1 AND passed=TRUE',uid)]
         from app.career import read_story
         workspace['career_story']=await read_story(c,uid)
-        workspace['insights']=build_insights(workspace['cv'],workspace['evidence'],[{'badge_id':b,'passed':True} for b in workspace['earned_badges']],user.get('github_identity',{}),workspace['history'])
+        workspace['insights']=build_insights(workspace['cv'],[e for e in workspace['evidence'] if eligible(e)],[{'badge_id':b,'passed':True} for b in workspace['earned_badges']],user.get('github_identity',{}),workspace['history'])
         workspace['review_audit']=[record(r) for r in await c.fetch('SELECT * FROM review_decisions WHERE user_id=$1 ORDER BY id DESC LIMIT 100',uid)]
         return workspace
 
@@ -326,13 +329,16 @@ async def submit_attempt(attempt_id:str,payload:Answers,user=Depends(current_use
             await c.execute('SELECT id FROM users WHERE id=$1 FOR UPDATE',user['id'])
             attempt=await c.fetchrow('SELECT * FROM attempts WHERE id=$1 AND user_id=$2 FOR UPDATE',attempt_id,user['id'])
             if not attempt: raise HTTPException(404,'Attempt not found')
+            from app.verification import integrity_event
             if attempt['submitted_at']:
+                await integrity_event(c,attempt,'replayed')
                 return {'id':attempt_id,'passed':attempt['passed'],'correct_count':attempt['correct_count'],'score_delta':float(attempt['score_delta']),'replayed':True}
             if attempt['expires_at']<datetime.now(timezone.utc): raise HTTPException(409,'Attempt expired. Start another challenge')
             try: correct,passed=grade(attempt['badge_id'],decode(attempt['question_ids']),payload.answers)
             except ValueError as e: raise HTTPException(422,str(e)) from e
             before=await recalculate(c,user['id'],'Before challenge')
             await c.execute('UPDATE attempts SET submitted_at=NOW(),answers=$2::jsonb,correct_count=$3,passed=$4 WHERE id=$1',attempt_id,json.dumps(payload.answers),correct,passed)
+            await integrity_event(c,attempt,'submitted')
             after=await recalculate(c,user['id'],'Challenge '+attempt['badge_id'])
             delta=round(after['total']-before['total'],2)
             await c.execute('UPDATE attempts SET score_delta=$2 WHERE id=$1',attempt_id,delta)
@@ -414,6 +420,7 @@ async def remove_evidence(evidence_id:str,user=Depends(current_user)):
             result=await c.execute('DELETE FROM evidence WHERE id=$1 AND user_id=$2',evidence_id,user['id'])
             if result=='DELETE 0': raise HTTPException(404,'Evidence not found')
             await recalculate(c,user['id'],'Evidence removed')
+            await event(c,user['id'],'verification','Evidence removed')
     return {'ok':True}
 
 @router.get('/reviews')
@@ -497,9 +504,9 @@ async def read_activity(user=Depends(current_user)):
     return {'ok':True}
 
 @router.post('/shares',status_code=201)
-async def share(user=Depends(current_user)):
+async def share(expires_days:int=Query(default=7,ge=1,le=90),user=Depends(current_user)):
     sid=secrets.token_urlsafe(24)
-    async with db() as c: await c.execute('INSERT INTO shares(id,user_id) VALUES($1,$2)',sid,user['id'])
+    async with db() as c: await c.execute("INSERT INTO shares(id,user_id,expires_at) VALUES($1,$2,NOW()+($3 * INTERVAL '1 day'))",sid,user['id'],expires_days)
     return {'id':sid,'url':settings.web_url.rstrip('/')+'/#/share/'+sid}
 
 @router.delete('/shares/{share_id}')
@@ -512,7 +519,7 @@ async def revoke(share_id:str,user=Depends(current_user)):
 async def public_data(c,uid):
     profile=await c.fetchrow('SELECT id,handle,display_name,bio FROM users WHERE id=$1',uid)
     data=await cv_data(c,uid)
-    evidence=[record(r) for r in await c.fetch("SELECT id,kind,title,url,detail,status,review_note,updated_at FROM evidence WHERE user_id=$1 AND status='verified'",uid)]
+    evidence=[record(r) for r in await c.fetch("SELECT id,kind,title,url,detail,status,review_note,updated_at FROM evidence WHERE user_id=$1 AND status='verified' AND eligibility_state='current' AND (review_due_at IS NULL OR review_due_at>NOW())",uid)]
     # Private contact information and proof documents never enter public payloads.
     from app.career import public_story
     return {'career_story':await public_story(c,uid),'profile':dict(profile),'skills':data.get('skills',[]),'projects':data.get('projects',[]),'score':await recalculate(c,uid,'Public profile refreshed'),'evidence':evidence,'badges':[r['badge_id'] for r in await c.fetch('SELECT DISTINCT badge_id FROM attempts WHERE user_id=$1 AND passed=TRUE',uid)]}
@@ -527,7 +534,7 @@ async def public_profile(handle:str):
 @router.get('/share/{share_id}')
 async def shared_profile(share_id:str):
     async with db() as c:
-        uid=await c.fetchval('SELECT user_id FROM shares WHERE id=$1 AND revoked=FALSE',share_id)
+        uid=await c.fetchval("SELECT user_id FROM shares WHERE id=$1 AND revoked=FALSE AND kind='profile' AND (expires_at IS NULL OR expires_at>NOW())",share_id)
         if not uid: raise HTTPException(404,'Share is unavailable or revoked')
         return await public_data(c,uid)
 

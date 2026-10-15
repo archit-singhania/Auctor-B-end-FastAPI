@@ -36,7 +36,7 @@ async def read_story(c, uid):
 
 async def public_story(c, uid):
     story = await read_story(c, uid)
-    allowed = {r['id']:dict(r) for r in await c.fetch("SELECT id,title,kind,status FROM evidence WHERE user_id=$1 AND status='verified'", uid)}
+    allowed = {r['id']:dict(r) for r in await c.fetch("SELECT id,title,kind,status FROM evidence WHERE user_id=$1 AND status='verified' AND eligibility_state='current' AND (review_due_at IS NULL OR review_due_at>NOW())", uid)}
     return {'revision':story['revision'], 'milestones':[
         {**{k:m[k] for k in ('id','title','date','kind','narrative','annotation')},
          'narrative_status':'Candidate-written narrative; not independently verified',

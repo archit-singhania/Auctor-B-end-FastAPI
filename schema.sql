@@ -146,3 +146,25 @@ CREATE TABLE IF NOT EXISTS auctor.evidence_comparisons (id TEXT PRIMARY KEY,user
 CREATE TABLE IF NOT EXISTS auctor.practice_sessions (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,revision INT NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'active',questions JSONB NOT NULL,source JSONB NOT NULL,answers JSONB NOT NULL DEFAULT '{}',review JSONB NOT NULL DEFAULT '{}',feedback JSONB NOT NULL DEFAULT '{}',started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),expires_at TIMESTAMPTZ NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
 CREATE INDEX IF NOT EXISTS practice_owner_idx ON auctor.practice_sessions(user_id,started_at DESC);
 INSERT INTO auctor.schema_versions(version) VALUES (5) ON CONFLICT DO NOTHING;
+
+ALTER TABLE auctor.shares ADD COLUMN IF NOT EXISTS kind TEXT NOT NULL DEFAULT 'profile';
+ALTER TABLE auctor.shares ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ;
+CREATE TABLE IF NOT EXISTS auctor.recruiter_presentations (user_id INT PRIMARY KEY REFERENCES auctor.users(id) ON DELETE CASCADE,revision INT NOT NULL,data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS auctor.recruiter_presentation_shares (share_id TEXT PRIMARY KEY REFERENCES auctor.shares(id) ON DELETE CASCADE,data JSONB NOT NULL);
+INSERT INTO auctor.schema_versions(version) VALUES (6) ON CONFLICT DO NOTHING;
+
+ALTER TABLE auctor.evidence ADD COLUMN IF NOT EXISTS review_due_at TIMESTAMPTZ;
+ALTER TABLE auctor.evidence ADD COLUMN IF NOT EXISTS eligibility_state TEXT NOT NULL DEFAULT 'current';
+CREATE TABLE IF NOT EXISTS auctor.verification_receipts (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,evidence_id TEXT NOT NULL,payload JSONB NOT NULL,signature TEXT NOT NULL,revoked BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS auctor.evidence_lifecycle_audit (id SERIAL PRIMARY KEY,evidence_id TEXT NOT NULL,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,reviewer_id INT REFERENCES auctor.users(id),state TEXT NOT NULL,note TEXT NOT NULL,review_due_at TIMESTAMPTZ,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS auctor.evidence_rechecks (id TEXT PRIMARY KEY,evidence_id TEXT NOT NULL REFERENCES auctor.evidence(id) ON DELETE CASCADE,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'pending',reason TEXT NOT NULL,note TEXT NOT NULL DEFAULT '',reviewer_id INT REFERENCES auctor.users(id),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),decided_at TIMESTAMPTZ);
+CREATE UNIQUE INDEX IF NOT EXISTS pending_recheck_unique ON auctor.evidence_rechecks(evidence_id) WHERE status='pending';
+CREATE TABLE IF NOT EXISTS auctor.assessment_integrity_events (id SERIAL PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,attempt_id TEXT NOT NULL,sequence INT NOT NULL,outcome TEXT NOT NULL,elapsed_seconds DOUBLE PRECISION NOT NULL,received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(attempt_id,sequence));
+CREATE TABLE IF NOT EXISTS auctor.assessment_integrity_signals (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,attempt_id TEXT NOT NULL,kind TEXT NOT NULL,data JSONB NOT NULL,review_status TEXT NOT NULL DEFAULT 'pending',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(attempt_id,kind));
+CREATE TABLE IF NOT EXISTS auctor.integrity_review_audit (id SERIAL PRIMARY KEY,signal_id TEXT NOT NULL REFERENCES auctor.assessment_integrity_signals(id) ON DELETE CASCADE,reviewer_id INT REFERENCES auctor.users(id),disposition TEXT NOT NULL,note TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+INSERT INTO auctor.schema_versions(version) VALUES (7) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.recruiter_integrations (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,name TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,scopes JSONB NOT NULL,webhook_url TEXT NOT NULL DEFAULT '',secret_cipher TEXT NOT NULL,revoked BOOLEAN NOT NULL DEFAULT FALSE,expires_at TIMESTAMPTZ NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS auctor.integration_outbox (event_id TEXT PRIMARY KEY,integration_id TEXT NOT NULL REFERENCES auctor.recruiter_integrations(id) ON DELETE CASCADE,payload JSONB NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INT NOT NULL DEFAULT 0,last_error TEXT,next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),delivered_at TIMESTAMPTZ);
+CREATE INDEX IF NOT EXISTS outbox_delivery_idx ON auctor.integration_outbox(status,next_attempt_at);
+INSERT INTO auctor.schema_versions(version) VALUES (8) ON CONFLICT DO NOTHING;

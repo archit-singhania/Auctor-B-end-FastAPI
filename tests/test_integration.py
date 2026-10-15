@@ -146,7 +146,7 @@ def test_reviewer_and_discovery_privacy(client):
     assert len(listed.json())==1
     assert client.get('/api/export?format=pdf',headers=dev).content.startswith(b'%PDF-')
     assert client.get('/api/badge/proof-developer.svg').status_code==200
-    assert client.get('/health').json()['schema_version']==5
+    assert client.get('/health').json()['schema_version']==8
 
 def test_oauth_ownership_and_project_binding(client,monkeypatch):
     import httpx
@@ -395,3 +395,135 @@ def test_snapshot_cancel_retry_and_cached_repository_freeze(client,monkeypatch):
         if current['status']=='ready':break
         time.sleep(.05)
     assert current['status']=='ready' and 'Original cached description' in current['data']['text'] and 'Changed later' not in current['data']['text']
+
+
+def test_recruiter_presentation_review_scope_expiry_revocation_and_pdf(client):
+    import json,io
+    from pdfminer.high_level import extract_text
+    owner=account(client,'presentation-owner@example.test','presentation-owner');other=account(client,'presentation-other@example.test','presentation-other')
+    cv={'skills':['Docker'],'projects':[{'name':'Selected service','description':'A real observable outcome','tech_stack':['Docker']}],'experience':[],'profiles':{'email':'private-contact@example.test'}}
+    assert client.put('/api/cv',headers=owner,json={'data':cv}).status_code==200
+    evidence=client.post('/api/evidence',headers=owner,json={'kind':'certificate','title':'Selected evidence','detail':{'skills':['Docker'],'private':'SECRET_PROOF'}}).json()['id']
+    foreign=client.post('/api/evidence',headers=other,json={'kind':'certificate','title':'Other account'}).json()['id']
+    async def verify():
+        from app.platform import db
+        async with db() as c: await c.execute("UPDATE evidence SET status='verified' WHERE id=$1",evidence)
+    client.portal.call(verify)
+    assert client.put('/api/career-story',headers=owner,json={'revision':0,'milestones':[{'id':'public','date':'2026-01-01','title':'Public milestone','narrative':'Released a service','visible':True,'evidence_ids':[evidence]},{'id':'private','date':'2026-01-02','title':'SECRET_MILESTONE','visible':False}]}).status_code==200
+    role={'revision':0,'title':'PRIVATE_ROLE_TITLE','description':'PRIVATE_JOB_SPEC','reviewed':True,'requirements':[{'skill':'Docker'}]}
+    assert client.put('/api/role-fit',headers=owner,json=role).status_code==200
+    run=client.post('/api/role-fit/runs',headers=owner).json()['id']
+    body={'revision':0,'title':'Selected recruiter story','introduction':'A focused candidate introduction','private_notes':'SECRET_NOTES','milestone_ids':['public','private'],'project_names':['Selected service'],'evidence_ids':[evidence],'role_run_id':run}
+    assert client.put('/api/presentations',headers=owner,json={**body,'evidence_ids':[foreign]}).status_code==404
+    assert client.put('/api/presentations',headers=owner,json=body).status_code==200
+    assert client.put('/api/presentations',headers=owner,json=body).status_code==409
+    preview=client.get('/api/presentations/preview',headers=owner).json()
+    public=json.dumps(preview['data']);assert all(secret not in public for secret in ['SECRET_NOTES','SECRET_PROOF','SECRET_MILESTONE','private-contact','PRIVATE_JOB_SPEC','PRIVATE_ROLE_TITLE'])
+    assert len(preview['data']['career_story']['milestones'])==1 and preview['data']['role_fit']['contributions'][0]['status']=='publicly evidenced'
+    publish={'revision':1,'preview_sha256':preview['preview_sha256'],'expires_days':7}
+    assert client.post('/api/presentations/shares',headers=owner,json=publish).status_code==400
+    assert client.post('/api/presentations/shares',headers=other,json={**publish,'confirm_public':True}).status_code==409
+    published=client.post('/api/presentations/shares',headers=owner,json={**publish,'confirm_public':True});assert published.status_code==201,published.text
+    sid=published.json()['id'];assert client.get('/api/share/'+sid).status_code==404
+    assert client.get('/api/presentations/shared/'+sid).status_code==200
+    pdf=client.get('/api/presentations/shared/'+sid+'/brief.pdf');assert pdf.status_code==200 and pdf.content.startswith(b'%PDF-')
+    text=extract_text(io.BytesIO(pdf.content));assert 'Selected recruiter story' in text and 'Selected service' in text and 'SECRET' not in text
+    output=__import__('pathlib').Path('../Auctor-F-end-Flutter/output/pdf');output.mkdir(parents=True,exist_ok=True);(output/'auctor-interview-brief.pdf').write_bytes(pdf.content)
+    async def revoke_source():
+        from app.platform import db
+        async with db() as c:await c.execute("UPDATE evidence SET status='rejected' WHERE id=$1",evidence)
+    client.portal.call(revoke_source)
+    data=client.get('/api/presentations/shared/'+sid).json();assert data['evidence']==[] and data['role_fit']['contributions'][0]['sources']==[]
+    assert client.post('/api/presentations/shares',headers=owner,json={**publish,'confirm_public':True}).status_code==409
+    assert client.delete('/api/shares/'+sid,headers=owner).status_code==200
+    assert client.get('/api/presentations/shared/'+sid+'/brief.pdf').status_code==404
+    fresh=client.get('/api/presentations/preview',headers=owner).json();new=client.post('/api/presentations/shares',headers=owner,json={'revision':1,'preview_sha256':fresh['preview_sha256'],'confirm_public':True,'expires_days':1}).json()['id']
+    async def expire():
+        from app.platform import db
+        async with db() as c:await c.execute("UPDATE shares SET expires_at=NOW()-INTERVAL '1 second' WHERE id=$1",new)
+    client.portal.call(expire);assert client.get('/api/presentations/shared/'+new).status_code==404
+
+
+def test_receipt_rotation_tamper_reverification_and_human_integrity(client):
+    from datetime import datetime,timezone,timedelta
+    from app import verification_keys
+    owner=account(client,'trust-owner@example.test','trust-owner');other=account(client,'trust-other@example.test','trust-other');reviewer=account(client,'trust-reviewer@example.test','trust-reviewer')
+    async def grant():
+        from app.platform import db
+        async with db() as c:await c.execute("UPDATE users SET role='reviewer' WHERE email='trust-reviewer@example.test'")
+    client.portal.call(grant)
+    eid=client.post('/api/evidence',headers=owner,json={'kind':'certificate','title':'Scope test','url':'https://example.test/proof','detail':{'skills':['Docker'],'private':'PRIVATE_SOURCE'}}).json()['id']
+    assert client.post('/api/verification/evidence/'+eid+'/receipts',headers=owner).status_code==409
+    assert client.post('/api/reviews/'+eid,headers=reviewer,json={'status':'verified','note':'Inspected source for this controlled fixture'}).status_code==200
+    issued=client.post('/api/verification/evidence/'+eid+'/receipts',headers=owner);assert issued.status_code==201,issued.text
+    signed=issued.json();rid=signed['payload']['receipt_id'];assert 'PRIVATE_SOURCE' not in str(signed)
+    status=client.post('/api/verification/verify',json=signed).json();assert status['signature_valid'] and status['currently_eligible'] and status['snapshot_current']
+    tampered={**signed,'payload':{**signed['payload'],'scope':'Forged scope'}};assert not client.post('/api/verification/verify',json=tampered).json()['signature_valid']
+    old=signed['payload']['key_id'];verification_keys.rotate();assert old in {k['key_id'] for k in client.get('/api/verification/keys').json()['keys']}
+    assert client.post('/api/verification/verify',json=signed).json()['signature_valid']
+    assert client.delete('/api/verification/receipts/'+rid,headers=other).status_code==404
+    assert client.put('/api/verification/evidence/'+eid+'/lifecycle',headers=owner,json={'state':'stale','note':'Not a reviewer'}).status_code==403
+    future=(datetime.now(timezone.utc)+timedelta(days=30)).isoformat()
+    assert client.put('/api/verification/evidence/'+eid+'/lifecycle',headers=reviewer,json={'state':'current','review_due_at':future,'note':'Assigned explicit review date'}).status_code==200
+    async def due():
+        from app.platform import db
+        async with db() as c:await c.execute("UPDATE evidence SET review_due_at=NOW()-INTERVAL '1 second' WHERE id=$1",eid)
+        from app.verification import expire_due
+        await expire_due();await expire_due()
+    client.portal.call(due)
+    current=client.get('/api/verification/receipts/'+rid).json()['status'];assert current['signature_valid'] and not current['currently_eligible']
+    checks=client.get('/api/verification/rechecks',headers=owner).json();assert len(checks)==1
+    assert client.post('/api/verification/evidence/'+eid+'/recheck',headers=owner).json()['replayed']
+    assert client.get('/api/verification/rechecks',headers=other).json()==[]
+    assert client.post('/api/verification/rechecks/'+checks[0]['id']+'/decision',headers=reviewer,json={'approved':True,'state':'current','review_due_at':future,'note':'Manually inspected unchanged proof'}).status_code==200
+    assert client.get('/api/verification/receipts/'+rid).json()['status']['currently_eligible']
+    assert client.delete('/api/verification/receipts/'+rid,headers=owner).status_code==200
+    revoked=client.get('/api/verification/receipts/'+rid).json()['status'];assert revoked['signature_valid'] and revoked['revoked']
+    attempt=client.post('/api/challenges/docker/attempts',headers=owner).json()['id'];answers={'answers':{str(i):q[2] for i,q in enumerate(CATALOG['docker'][2])}}
+    first=client.post('/api/attempts/'+attempt+'/submit',headers=owner,json=answers);assert first.status_code==200
+    for _ in range(3):assert client.post('/api/attempts/'+attempt+'/submit',headers=owner,json=answers).json()['replayed']
+    signals=client.get('/api/verification/integrity',headers=owner).json();assert {'rapid_submission','repeated_replays'}<={s['kind'] for s in signals}
+    before=client.get('/api/me',headers=owner).json()['score']
+    sid=signals[0]['id'];body={'disposition':'dismissed','note':'Controlled fixture, no adverse inference'}
+    assert client.post('/api/verification/integrity/'+sid+'/review',headers=other,json=body).status_code==403
+    assert client.post('/api/verification/integrity/'+sid+'/review',headers=reviewer,json=body).status_code==200
+    assert client.get('/api/verification/integrity-audit',headers=owner).json()[-1]['disposition']=='dismissed'
+    assert client.get('/api/me',headers=owner).json()['score']==before
+
+
+def test_scoped_integrations_signed_local_delivery_and_revocation(client,monkeypatch):
+    import threading,time,json,hmac,hashlib
+    from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
+    from app.config import settings
+    received=[]
+    class Receiver(BaseHTTPRequestHandler):
+        def do_POST(self):
+            content=self.rfile.read(int(self.headers['Content-Length']));received.append((dict(self.headers),content));self.send_response(503 if len(received)==1 else 204);self.end_headers()
+        def log_message(self,*args):pass
+    server=ThreadingHTTPServer(('127.0.0.1',0),Receiver);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    try:
+        owner=account(client,'integration-owner@example.test','integration-owner');other=account(client,'integration-other@example.test','integration-other')
+        body={'name':'Local consent fixture','scopes':['profile:read','verification:read'],'webhook_url':f'http://127.0.0.1:{server.server_port}/updates','confirm_consent':True}
+        assert client.post('/api/integrations',headers=owner,json=body).status_code==422
+        monkeypatch.setattr(settings,'webhook_development_mode',True)
+        created=client.post('/api/integrations',headers=owner,json=body);assert created.status_code==201,created.text
+        value=created.json();iid=value['id'];token={'Authorization':'Bearer '+value['credential']}
+        listing=client.get('/api/integrations',headers=owner).json();assert 'credential' not in str(listing) and 'secret_cipher' not in str(listing)
+        assert client.get('/api/integrations/recruiter/profile',headers=token).status_code==200
+        assert client.get('/api/integrations/recruiter/verification',headers=token).status_code==200
+        assert client.get('/api/integrations/'+iid+'/deliveries',headers=other).status_code==404
+        assert client.put('/api/cv',headers=owner,json={'data':{'skills':['Docker'],'projects':[],'experience':[],'profiles':{'email':'PRIVATE_CONTACT@example.test'}}}).status_code==200
+        for _ in range(200):
+            if len(received)>=2:break
+            time.sleep(.05)
+        assert len(received)>=2 and received[0][0]['X-Auctor-Event-Id']==received[1][0]['X-Auctor-Event-Id']
+        headers,content=received[-1];expected=hmac.new(value['webhook_secret'].encode(),headers['X-Auctor-Timestamp'].encode()+b'.'+content,hashlib.sha256).hexdigest()
+        assert headers['X-Auctor-Signature']=='v1='+expected and json.loads(content)['event_id']==headers['X-Auctor-Event-Id']
+        assert b'PRIVATE_CONTACT' not in content and b'PRIVATE_CONTACT' not in client.get('/api/integrations/recruiter/profile',headers=token).content
+        assert client.delete('/api/integrations/'+iid,headers=other).status_code==404
+        assert client.delete('/api/integrations/'+iid,headers=owner).status_code==200
+        assert client.get('/api/integrations/recruiter/profile',headers=token).status_code==401
+        previous=len(received);client.put('/api/cv',headers=owner,json={'data':{'skills':['Redis'],'projects':[],'experience':[],'profiles':{}}});time.sleep(.3);assert len(received)==previous
+        read_only=client.post('/api/integrations',headers=owner,json={'name':'Profile only','scopes':['profile:read'],'confirm_consent':True}).json()
+        assert client.get('/api/integrations/recruiter/verification',headers={'Authorization':'Bearer '+read_only['credential']}).status_code==403
+    finally:server.shutdown();server.server_close();thread.join(timeout=2)

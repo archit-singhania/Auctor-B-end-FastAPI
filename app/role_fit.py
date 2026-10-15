@@ -8,6 +8,7 @@ from typing import Literal
 from app.platform import current_user, db, decode, cv_data, record
 from app.insights import track_for, skill_key
 from app.domain import CATALOG
+from app.eligibility import eligible as evidence_eligible
 
 FORMULA='evidenced-coverage-v1'
 VOCABULARY='auctor-skills-v1'
@@ -40,7 +41,7 @@ class RoleDocument(BaseModel):
         return self
 
 def evaluate(document,cv,evidence,badges):
-    eligible=[e for e in evidence if e['status']=='verified']
+    eligible=[e for e in evidence if evidence_eligible(e)]
     declared={key(s) for s in cv.get('skills',[])}
     contributions=[]
     for r in document['requirements']:
@@ -88,7 +89,7 @@ async def run(user=Depends(current_user)):
         async with c.transaction(isolation='repeatable_read'):
             role=await document(c,user['id'])
             if not role['reviewed'] or not role['requirements']:raise HTTPException(400,'Review and save at least one requirement before matching')
-            evidence=[record(r) for r in await c.fetch('SELECT id,kind,title,status,detail FROM evidence WHERE user_id=$1 ORDER BY id',user['id'])]
+            evidence=[record(r) for r in await c.fetch('SELECT id,kind,title,status,detail,review_due_at,eligibility_state FROM evidence WHERE user_id=$1 ORDER BY id',user['id'])]
             badges=[r['badge_id'] for r in await c.fetch('SELECT DISTINCT badge_id FROM attempts WHERE user_id=$1 AND passed=TRUE',user['id'])]
             result=evaluate(role,await cv_data(c,user['id']),evidence,badges);rid=secrets.token_urlsafe(18)
             await c.execute('INSERT INTO role_fit_runs(id,user_id,result) VALUES($1,$2,$3::jsonb)',rid,user['id'],json.dumps(result,default=str))
