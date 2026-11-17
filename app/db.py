@@ -56,7 +56,9 @@ async def run_migrations() -> None:
     try:
         conn = await _pool.acquire()  # type: ignore[union-attr]
         try:
-            await conn.execute(sql)
+            async with conn.transaction():
+                await conn.execute("SELECT set_config('app.privacy_purge','on',true)")
+                await conn.execute(sql)
             logger.info("DB migrations applied successfully")
         finally:
             await _pool.release(conn)  # type: ignore[union-attr]

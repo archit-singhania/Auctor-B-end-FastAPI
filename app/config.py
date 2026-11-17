@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 import os
 import ipaddress
 from pathlib import Path
@@ -72,6 +73,8 @@ class Settings(BaseSettings):
     web_url: str = "http://localhost:8080"
     reviewer_emails: str = ""
     storage_path: str = "_data"
+    deletion_ledger_path: str = ""
+    backup_retention_days: int = Field(default=30, ge=1, le=3650)
     app_env: str = "development"
     webhook_development_mode: bool = False
     public_api_url: str = ""
@@ -110,6 +113,9 @@ class Settings(BaseSettings):
         volume, storage = Path(volume_value), Path(self.storage_path)
         if not volume.is_absolute() or not volume.is_dir() or not storage.is_absolute():
             raise RuntimeError("Production storage must use an existing absolute private volume")
+        ledger = Path(self.deletion_ledger_path)
+        if not self.deletion_ledger_path or not ledger.is_absolute() or not ledger.resolve().is_relative_to(volume.resolve()):
+            raise RuntimeError('Production requires DELETION_LEDGER_PATH on the persistent volume, preserved separately during backup restoration')
         if not storage.resolve().is_relative_to(volume.resolve()):
             raise RuntimeError("Production STORAGE_PATH must remain inside the private volume")
 

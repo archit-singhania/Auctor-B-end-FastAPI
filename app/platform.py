@@ -49,7 +49,7 @@ async def current_user(request: Request):
     authorization=request.headers.get('authorization','')
     if not authorization.startswith('Bearer '): raise HTTPException(401,'Sign in to continue')
     async with db() as c:
-        row=await c.fetchrow('SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=$1 AND s.expires_at>NOW()',token_hash(authorization[7:]))
+        row=await c.fetchrow("SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token_hash=$1 AND s.expires_at>NOW() AND u.account_state='active'",token_hash(authorization[7:]))
     if not row: raise HTTPException(401,'Session expired. Sign in again')
     return record(row)
 
@@ -122,6 +122,8 @@ class Answers(BaseModel):
     answers:dict[str,int]
 
 async def session(c,uid):
+    if await c.fetchval('SELECT account_state FROM users WHERE id=$1 FOR UPDATE',uid) != 'active':
+        raise HTTPException(401,'Account unavailable')
     value=secrets.token_urlsafe(40)
     await c.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,NOW()+INTERVAL '30 days')",token_hash(value),uid)
     return {'token':value,'expires_in':2592000}
@@ -159,7 +161,7 @@ def rate_limit(request,kind,maximum=60):
 async def login(payload:Credentials,request:Request):
     rate_limit(request,'auth',8)
     async with db() as c:
-        row=await c.fetchrow('SELECT id,password_hash FROM users WHERE email=$1',payload.email)
+        row=await c.fetchrow("SELECT id,password_hash FROM users WHERE email=$1 AND account_state='active'",payload.email)
         encoded=row['password_hash'] if row and row['password_hash'] else 'pbkdf2_sha256$600000$invalid$invalid'
         valid=await asyncio.to_thread(check_password,payload.password,encoded)
         if not row or not valid: raise HTTPException(401,'Email or password is incorrect')
@@ -223,12 +225,18 @@ async def save_file(file,folder):
     if settings.app_env == 'production':
         import os
         if os.name != 'nt': await asyncio.to_thread(dest.chmod,0o600)
+    if folder.startswith('accounts/'):
+        async with db() as c:
+            active = await c.fetchval("SELECT id FROM users WHERE account_key=$1 AND account_state='active'", folder.split('/')[1])
+        if not active:
+            await asyncio.to_thread(dest.unlink, missing_ok=True)
+            raise HTTPException(409,'Account became unavailable during upload')
     return key
 
 @router.post('/cv/jobs',status_code=202)
 async def upload_cv(request:Request,file:UploadFile=File(...),user=Depends(current_user)):
     rate_limit(request,'parse',5)
-    key=await save_file(file,'cv')
+    key=await save_file(file,f"accounts/{user['account_key']}/cv")
     jid=secrets.token_urlsafe(18)
     async with db() as c:
         await c.execute('INSERT INTO documents(id,user_id,filename,storage_key) VALUES($1,$2,$3,$4)',jid,user['id'],(file.filename or 'Resume.pdf')[:200],key)
@@ -318,9 +326,15 @@ async def start_attempt(badge_id:str,user=Depends(current_user)):
             if not row:
                 recent=await c.fetchval("SELECT COUNT(*) FROM attempts WHERE user_id=$1 AND started_at>NOW()-INTERVAL '1 hour'",user['id'])
                 if recent>=10: raise HTTPException(429,'Assessment limit reached. Practice, then return in an hour')
+                from app.assessment_quality import catalog
+                snapshot = await catalog(c, badge_id)
+                if any(q['retired'] for q in snapshot['questions']):
+                    raise HTTPException(409, 'Assessment temporarily unavailable while retired questions are revised')
                 aid=secrets.token_urlsafe(18)
-                row=await c.fetchrow("INSERT INTO attempts(id,user_id,badge_id,question_ids,expires_at) VALUES($1,$2,$3,$4::jsonb,NOW()+INTERVAL '5 minutes') RETURNING *",aid,user['id'],badge_id,json.dumps(ids))
-    return {'id':row['id'],'badge_id':badge_id,'expires_at':row['expires_at'],'questions':[public_question(badge_id,i) for i in decode(row['question_ids'])]}
+                row=await c.fetchrow("INSERT INTO attempts(id,user_id,badge_id,question_ids,expires_at,question_snapshot) VALUES($1,$2,$3,$4::jsonb,NOW()+INTERVAL '5 minutes',$5::jsonb) RETURNING *",aid,user['id'],badge_id,json.dumps(ids),json.dumps(snapshot))
+    from app.assessment_quality import public_questions
+    questions = public_questions(decode(row['question_snapshot']), decode(row['question_ids'])) if row['question_snapshot'] else [public_question(badge_id,i) for i in decode(row['question_ids'])]
+    return {'id':row['id'],'badge_id':badge_id,'expires_at':row['expires_at'],'questions':questions}
 
 @router.post('/attempts/{attempt_id}/submit')
 async def submit_attempt(attempt_id:str,payload:Answers,user=Depends(current_user)):
@@ -334,7 +348,9 @@ async def submit_attempt(attempt_id:str,payload:Answers,user=Depends(current_use
                 await integrity_event(c,attempt,'replayed')
                 return {'id':attempt_id,'passed':attempt['passed'],'correct_count':attempt['correct_count'],'score_delta':float(attempt['score_delta']),'replayed':True}
             if attempt['expires_at']<datetime.now(timezone.utc): raise HTTPException(409,'Attempt expired. Start another challenge')
-            try: correct,passed=grade(attempt['badge_id'],decode(attempt['question_ids']),payload.answers)
+            from app.assessment_quality import grade_snapshot
+            try:
+                correct,passed = grade_snapshot(decode(attempt['question_snapshot']),decode(attempt['question_ids']),payload.answers) if attempt['question_snapshot'] else grade(attempt['badge_id'],decode(attempt['question_ids']),payload.answers)
             except ValueError as e: raise HTTPException(422,str(e)) from e
             before=await recalculate(c,user['id'],'Before challenge')
             await c.execute('UPDATE attempts SET submitted_at=NOW(),answers=$2::jsonb,correct_count=$3,passed=$4 WHERE id=$1',attempt_id,json.dumps(payload.answers),correct,passed)
@@ -399,7 +415,7 @@ async def attach_proof(evidence_id:str,file:UploadFile=File(...),user=Depends(cu
         row=await c.fetchrow('SELECT * FROM evidence WHERE id=$1 AND user_id=$2',evidence_id,user['id'])
         if not row: raise HTTPException(404,'Evidence not found')
         if row['kind']=='project' or row['status']=='verified': raise HTTPException(409,'Create a new evidence submission to update reviewed proof')
-    key=await save_file(file,'proof')
+    key=await save_file(file,f"accounts/{user['account_key']}/proof")
     async with db() as c:
         updated=await c.fetchval("UPDATE evidence SET storage_key=$2,status='pending',updated_at=NOW() WHERE id=$1 AND user_id=$3 AND status<>'verified' AND kind<>'project' RETURNING id",evidence_id,key,user['id'])
         if not updated: raise HTTPException(409,'Evidence was reviewed or removed while the file uploaded. Create a new submission')

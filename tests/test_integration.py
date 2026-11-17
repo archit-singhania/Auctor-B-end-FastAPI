@@ -146,7 +146,7 @@ def test_reviewer_and_discovery_privacy(client):
     assert len(listed.json())==1
     assert client.get('/api/export?format=pdf',headers=dev).content.startswith(b'%PDF-')
     assert client.get('/api/badge/proof-developer.svg').status_code==200
-    assert client.get('/health').json()['schema_version']==8
+    assert client.get('/health').json()['schema_version']==18
 
 def test_oauth_ownership_and_project_binding(client,monkeypatch):
     import httpx
@@ -527,3 +527,532 @@ def test_scoped_integrations_signed_local_delivery_and_revocation(client,monkeyp
         read_only=client.post('/api/integrations',headers=owner,json={'name':'Profile only','scopes':['profile:read'],'confirm_consent':True}).json()
         assert client.get('/api/integrations/recruiter/verification',headers={'Authorization':'Bearer '+read_only['credential']}).status_code==403
     finally:server.shutdown();server.server_close();thread.join(timeout=2)
+
+def test_evidence_collection_owned_persistent_and_never_auto_verified(client):
+    owner = account(client, 'collection-owner@example.test', 'collection-owner')
+    other = account(client, 'collection-other@example.test', 'collection-other')
+    cv = {'skills': ['Python'], 'projects': [], 'experience': [], 'profiles': {}}
+    assert client.put('/api/cv', headers=owner, json={'data': cv}).status_code == 200
+    path = '/api/evidence-collection'
+    assert client.get(path).status_code == 401
+    claim = client.get(path, headers=owner).json()['claims'][0]
+    assert claim['status'] == 'missing source'
+    source = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Python course', 'url': 'https://example.test/course', 'detail': {}}).json()['id']
+    link = path + '/' + claim['id'] + '/links'
+    for _ in range(2):
+        assert client.post(link, headers=owner, json={'evidence_id': source}).status_code == 200
+    saved = client.get(path, headers=owner).json()['claims'][0]
+    assert len(saved['linked']) == 1
+    assert saved['status'] == 'no eligible reviewed source'
+    assert client.get(path, headers=other).json()['available_evidence'] == []
+    assert client.put('/api/cv', headers=other, json={'data': cv}).status_code == 200
+    assert client.post(link, headers=other, json={'evidence_id': source}).status_code == 404
+    cv['skills'] = ['Java']
+    assert client.put('/api/cv', headers=owner, json={'data': cv}).status_code == 200
+    assert client.post(link, headers=owner, json={'evidence_id': source}).status_code == 409
+    assert client.get(path, headers=owner).json()['claims'][0]['linked'] == []
+
+def test_private_applications_snapshot_revisions_and_calendar(client):
+    import uuid
+    owner = account(client, 'application-owner@example.test', 'application-owner')
+    other = account(client, 'application-other@example.test', 'application-other')
+    cv = {'skills': ['Python'], 'projects': [], 'experience': [], 'profiles': {}}
+    assert client.put('/api/cv', headers=owner, json={'data': cv}).status_code == 200
+    evidence = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Course', 'url': 'https://example.test/course', 'detail': {}}).json()['id']
+    data = {'id': str(uuid.uuid4()), 'revision': 0, 'employer': 'Example', 'role': 'Developer', 'stage': 'saved', 'evidence_ids': [evidence], 'interviews': [{'title': 'Technical interview', 'starts_at': '2026-12-01T10:00:00+05:30', 'duration_minutes': 45}]}
+    endpoint = '/api/applications'
+    assert client.put(endpoint, headers=other, json=data).status_code == 404
+    saved = client.put(endpoint, headers=owner, json=data)
+    assert saved.status_code == 200, saved.text
+    assert client.put(endpoint, headers=owner, json=data).json()['revision'] == 1
+    data = saved.json()
+    data['stage'] = 'applied'
+    updated = client.put(endpoint, headers=owner, json=data).json()
+    assert updated['revision'] == 2
+    data['stage'] = 'offer'
+    assert client.put(endpoint, headers=owner, json=data).status_code == 409
+    snapshot_path = endpoint + '/' + data['id'] + '/snapshots'
+    assert client.post(snapshot_path, headers=owner, json={'revision': 1}).status_code == 409
+    first = client.post(snapshot_path, headers=owner, json={'revision': 2}).json()
+    assert first['data']['cv']['skills'] == ['Python']
+    assert first['data']['evidence'][0]['status'] == 'pending'
+    cv['skills'] = ['Java']
+    client.put('/api/cv', headers=owner, json={'data': cv})
+    assert client.post(snapshot_path, headers=owner, json={'revision': 2}).json() == first
+    assert client.get(snapshot_path, headers=other).status_code == 404
+    assert client.get(endpoint, headers=other).json() == []
+    assert client.get(endpoint, headers=owner).json()[0]['stage'] == 'applied'
+    calendar = client.get(endpoint + '/' + data['id'] + '/calendar', headers=owner)
+    assert calendar.status_code == 200
+    assert 'DTSTART:20261201T043000Z' in calendar.text
+    assert 'DTEND:20261201T051500Z' in calendar.text
+    assert 'ATTENDEE' not in calendar.text
+    assert client.get(endpoint + '/' + data['id'] + '/calendar', headers=other).status_code == 404
+    updated['interviews'][0]['starts_at'] = '2026-12-01T10:00:00'
+    assert client.put(endpoint, headers=owner, json=updated).status_code == 422
+
+def test_case_study_publication_redaction_snapshot_and_revocation(client):
+    owner = account(client, 'case-owner@example.test', 'case-owner')
+    other = account(client, 'case-other@example.test', 'case-other')
+    endpoint = '/api/case-studies'
+    source = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Public course', 'url': 'https://example.test/private', 'detail': {'private': 'SECRET_DETAIL'}}).json()['id']
+    draft = client.get(endpoint, headers=owner).json()
+    draft['title'] = 'A reliable service'
+    draft['sections'][0]['text'] = '<script>alert(1)</script> ORIGINAL'
+    draft['sections'][0]['evidence_ids'] = [source]
+    assert client.put(endpoint, headers=other, json=draft).status_code == 404
+    saved = client.put(endpoint, headers=owner, json=draft).json()
+    assert client.put(endpoint, headers=owner, json=draft).status_code == 409
+    preview = client.get(endpoint + '/preview', headers=owner).json()
+    assert preview['data']['sections'][0]['evidence'] == []
+    async def verify():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("UPDATE evidence SET status='verified' WHERE id=$1", source)
+    client.portal.call(verify)
+    body = {'revision': saved['revision'], 'sha256': preview['sha256'], 'confirm_public': True}
+    assert client.post(endpoint + '/shares', headers=owner, json=body).status_code == 409
+    preview = client.get(endpoint + '/preview', headers=owner).json()
+    body['sha256'] = preview['sha256']
+    published = client.post(endpoint + '/shares', headers=owner, json=body)
+    assert published.status_code == 201, published.text
+    sid = published.json()['id']
+    path = endpoint + '/shared/' + sid
+    public = client.get(path)
+    assert public.status_code == 200
+    assert '&lt;script&gt;' in public.text and '<script>' not in public.text
+    assert 'SECRET_DETAIL' not in public.text and 'https://example.test/private' not in public.text
+    assert 'Public course' in public.text
+    saved['sections'][0]['text'] = 'DRAFT_EDIT'
+    assert client.put(endpoint, headers=owner, json=saved).status_code == 200
+    assert 'ORIGINAL' in client.get(path).text and 'DRAFT_EDIT' not in client.get(path).text
+    pdf = client.get(path + '/report.pdf')
+    assert pdf.status_code == 200 and pdf.content.startswith(b'%PDF-')
+    async def revoke_source():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("UPDATE evidence SET eligibility_state='revoked' WHERE id=$1", source)
+    client.portal.call(revoke_source)
+    assert 'Public course' not in client.get(path).text
+    assert 'historical sources' in client.get(path).text
+    assert client.get(endpoint + '/shares', headers=other).json() == []
+    assert client.delete('/api/shares/' + sid, headers=other).status_code == 404
+    assert client.delete('/api/shares/' + sid, headers=owner).status_code == 200
+    assert client.get(path).status_code == 404
+    assert client.get(path + '/report.pdf').status_code == 404
+
+def test_opt_in_analytics_privacy_bursts_owner_and_revocation(client):
+    owner = account(client, 'analytics-owner@example.test', 'analytics-owner')
+    other = account(client, 'analytics-other@example.test', 'analytics-other')
+    endpoint = '/api/analytics'
+    event = {'context': 'public', 'identifier': 'analytics-owner', 'kind': 'profile_view'}
+    assert client.get(endpoint, headers=owner).json()['enabled'] is False
+    assert client.post(endpoint + '/events', json=event).status_code == 404
+    assert client.patch('/api/me', headers=owner, json={'display_name': 'Owner', 'discoverable': True}).status_code == 200
+    assert client.post(endpoint + '/events', json=event).json()['counted'] is False
+    assert client.put(endpoint, headers=owner, json={'enabled': True}).status_code == 200
+    assert client.post(endpoint + '/events', headers=owner, json=event).json()['counted'] is False
+    assert client.post(endpoint + '/events', json=event).json()['counted'] is True
+    assert client.post(endpoint + '/events', headers=other, json=event).json()['counted'] is False
+    assert client.get(endpoint, headers=owner).json()['days'][0]['count'] == 1
+    assert client.get(endpoint, headers=other).json()['days'] == []
+    share = client.post('/api/shares', headers=owner).json()['id']
+    event['context'] = 'share'; event['identifier'] = share
+    assert client.post(endpoint + '/events', json=event).json()['counted'] is True
+    assert {d['kind'] for d in client.get(endpoint, headers=owner).json()['days']} == {'profile_view', 'share_activity'}
+    client.delete('/api/shares/' + share, headers=owner)
+    assert client.post(endpoint + '/events', json=event).status_code == 404
+    source = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Course', 'url': 'https://example.test/course', 'detail': {}}).json()['id']
+    event = {'context': 'public', 'identifier': 'analytics-owner', 'kind': 'evidence_open', 'evidence_id': source}
+    assert client.post(endpoint + '/events', json=event).status_code == 404
+    async def verify():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("UPDATE evidence SET status='verified' WHERE id=$1", source)
+    client.portal.call(verify)
+    opened = client.post(endpoint + '/events', json=event).json()
+    assert opened == {'counted': True, 'url': 'https://example.test/course'}
+    client.put(endpoint, headers=owner, json={'enabled': False})
+    before = client.get(endpoint, headers=owner).json()['days']
+    client.post(endpoint + '/events', json=event)
+    assert client.get(endpoint, headers=owner).json()['days'] == before
+    client.delete(endpoint, headers=owner)
+    assert client.get(endpoint, headers=owner).json()['days'] == []
+    assert client.get(endpoint).status_code == 401
+    client.put(endpoint, headers=owner, json={'enabled': True})
+    client.patch('/api/me', headers=owner, json={'display_name': 'Owner', 'discoverable': False})
+    private_share = client.post('/api/shares', headers=owner).json()['id']
+    assert client.post(endpoint + '/events', json={'context': 'share', 'identifier': private_share, 'kind': 'profile_view'}).json()['counted'] is False
+
+def test_recruiter_tray_persistence_density_ownership_and_withdrawal(client):
+    recruiter = account(client, 'explore-recruiter@example.test', 'explore-recruiter')
+    other = account(client, 'explore-other@example.test', 'explore-other')
+    candidate = account(client, 'explore-candidate@example.test', 'explore-candidate')
+    uid = client.get('/api/me', headers=candidate).json()['profile']['id']
+    endpoint = '/api/recruiter-exploration'
+    body = {'revision': 0, 'density': 'compact', 'candidate_ids': [uid]}
+    assert client.put(endpoint, headers=recruiter, json=body).status_code == 404
+    client.patch('/api/me', headers=candidate, json={'display_name': 'Visible candidate', 'discoverable': True})
+    assert client.put(endpoint, headers=recruiter, json=body).status_code == 200
+    saved = client.get(endpoint, headers=recruiter).json()
+    assert saved['revision'] == 1 and saved['density'] == 'compact'
+    assert saved['candidates'][0]['profile']['display_name'] == 'Visible candidate'
+    assert client.get(endpoint, headers=other).json()['candidate_ids'] == []
+    assert client.put(endpoint, headers=recruiter, json=body).status_code == 409
+    assert client.put(endpoint, headers=recruiter, json={**body, 'revision': 1, 'candidate_ids': [uid, uid]}).status_code == 422
+    client.patch('/api/me', headers=candidate, json={'display_name': 'Hidden candidate', 'discoverable': False})
+    hidden = client.get(endpoint, headers=recruiter).json()
+    assert hidden['candidates'] == [] and hidden['unavailable_count'] == 1
+    assert 'Hidden candidate' not in str(hidden)
+    assert client.put(endpoint, headers=recruiter, json={**body, 'revision': 1}).status_code == 404
+    assert client.put(endpoint, headers=recruiter, json={**body, 'revision': 1, 'candidate_ids': []}).status_code == 200
+    assert client.get(endpoint).status_code == 401
+
+def test_lineage_preserves_exact_source_and_publication_after_withdrawal(client):
+    import hashlib
+    owner = account(client, 'lineage-owner@example.test', 'lineage-owner')
+    other = account(client, 'lineage-other@example.test', 'lineage-other')
+    source = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Historical source', 'url': 'https://example.test/source', 'detail': {'version': 1}}).json()['id']
+    path = '/api/lineage/' + source
+    before = client.get(path, headers=owner).json()
+    assert len(before['revisions']) == 1
+    assert before['revisions'][0]['operation'] == 'INSERT'
+    async def verify():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("UPDATE evidence SET status='verified',updated_at=NOW() WHERE id=$1", source)
+    client.portal.call(verify)
+    draft = client.get('/api/case-studies', headers=owner).json()
+    draft['sections'][0]['text'] = 'Claim bound to a reviewed source'
+    draft['sections'][0]['evidence_ids'] = [source]
+    saved = client.put('/api/case-studies', headers=owner, json=draft).json()
+    preview = client.get('/api/case-studies/preview', headers=owner).json()
+    assert client.post('/api/case-studies/shares', headers=owner, json={'revision': saved['revision'], 'sha256': preview['sha256'], 'confirm_public': True}).status_code == 201
+    traced = client.get(path, headers=owner).json()
+    claim = next(r for r in traced['downstream'] if r['kind'] == 'published_claim')
+    assert len(claim['source_revision_ids']) == 1
+    original = next(r for r in traced['revisions'] if r['id'] == claim['source_revision_ids'][0])
+    assert original['payload']['title'] == 'Historical source'
+    assert hashlib.sha256(original['canonical_text'].encode()).hexdigest() == original['sha256']
+    assert client.get(path, headers=other).status_code == 404
+    assert client.get('/api/lineage', headers=other).json() == []
+    assert client.delete('/api/evidence/' + source, headers=owner).status_code == 200
+    withdrawn = client.get(path, headers=owner).json()
+    assert withdrawn['withdrawn'] and not withdrawn['currently_eligible']
+    assert withdrawn['revisions'][-1]['operation'] == 'DELETE'
+    assert original in withdrawn['revisions']
+    assert withdrawn['downstream'][0]['source_revision_ids'] == claim['source_revision_ids']
+
+def test_dispute_independence_correction_stale_source_and_history(client):
+    owner = account(client, 'appeal-owner@example.test', 'appeal-owner')
+    first = account(client, 'appeal-first@example.test', 'appeal-first')
+    second = account(client, 'appeal-second@example.test', 'appeal-second')
+    outsider = account(client, 'appeal-outsider@example.test', 'appeal-outsider')
+    async def grant():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("UPDATE users SET role='reviewer' WHERE email IN ('appeal-first@example.test','appeal-second@example.test')")
+    client.portal.call(grant)
+    second_id = client.get('/api/me', headers=second).json()['profile']['id']
+    first_id = client.get('/api/me', headers=first).json()['profile']['id']
+    source = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Appealed source', 'url': 'https://example.test/source', 'detail': {}}).json()['id']
+    assert client.post('/api/reviews/' + source, headers=first, json={'status': 'rejected', 'note': 'Initial review rejected the evidence'}).status_code == 200
+    body = {'evidence_id': source, 'reason': 'The source was incorrectly interpreted', 'requested_correction': 'Review the original issuer record', 'supporting_ids': [source]}
+    result = client.post('/api/disputes', headers=owner, json=body)
+    assert result.status_code == 201, result.text
+    did = result.json()['id']; path = '/api/disputes/' + did
+    assert client.post('/api/disputes', headers=owner, json=body).status_code == 409
+    assert client.get(path, headers=outsider).status_code == 404
+    revision = 1
+    def action(headers, kind, **extra):
+        return client.post(path + '/actions', headers=headers, json={'revision': revision, 'action': kind, 'note': 'Reviewed the complete source and supporting material', **extra})
+    assert action(owner, 'corrected', corrected_status='verified').status_code == 403
+    assert action(second, 'assign', reviewer_id=first_id).status_code == 403
+    assert action(second, 'assign', reviewer_id=second_id).status_code == 200
+    revision = 2
+    assert action(second, 'under_review').status_code == 200
+    revision = 3
+    assert action(second, 'awaiting_information').status_code == 200
+    revision = 4
+    assert action(owner, 'respond').status_code == 200
+    revision = 5
+    assert action(second, 'corrected', corrected_status='verified', source_sha256='stale').status_code == 409
+    current = client.get(path, headers=second).json()
+    assert action(second, 'corrected', corrected_status='verified', source_sha256=current['source_sha256']).status_code == 200
+    completed = client.get(path, headers=owner).json()
+    assert completed['state'] == 'corrected' and completed['revision'] == 6
+    assert completed['current_source']['status'] == 'verified'
+    assert completed['current_source']['eligibility_state'] == 'current'
+    assert len(completed['history']) == 6
+    assert completed['data']['original_source']['status'] == 'rejected'
+    assert action(second, 'upheld').status_code == 409
+    async def decisions():
+        from app.platform import db
+        async with db() as c:
+            return [r['status'] for r in await c.fetch('SELECT status FROM review_decisions WHERE evidence_id=$1 ORDER BY id', source)]
+    assert client.portal.call(decisions) == ['rejected', 'verified']
+
+def test_organization_roles_invitations_isolation_notes_and_consent(client):
+    owner = account(client, 'org-owner@example.test', 'org-owner')
+    member = account(client, 'org-member@example.test', 'org-member')
+    outsider = account(client, 'org-other@example.test', 'org-other')
+    candidate = account(client, 'org-candidate@example.test', 'org-candidate')
+    mid = client.get('/api/me', headers=member).json()['profile']['id']
+    uid = client.get('/api/me', headers=owner).json()['profile']['id']
+    cid = client.get('/api/me', headers=candidate).json()['profile']['id']
+    created = client.post('/api/organizations', headers=owner, json={'name': 'Review team'})
+    assert created.status_code == 201, created.text
+    path = '/api/organizations/' + created.json()['id']
+    assert client.get(path, headers=outsider).status_code == 404
+    invite = client.post(path + '/invitations', headers=owner, json={'email': 'org-member@example.test', 'role': 'reviewer'}).json()
+    assert client.post('/api/organizations/accept', headers=outsider, json={'token': invite['token']}).status_code == 404
+    assert client.post('/api/organizations/accept', headers=member, json={'token': invite['token']}).status_code == 200
+    assert client.post('/api/organizations/accept', headers=member, json={'token': invite['token']}).status_code == 404
+    assert client.post(path + '/invitations', headers=member, json={'email': 'another@example.test'}).status_code == 403
+    assert client.delete(path + '/members/' + str(uid), headers=owner).status_code == 403
+    note_path = path + '/profiles/' + str(cid)
+    assert client.put(note_path, headers=member, json={'revision': 0, 'text': 'Private review note'}).status_code == 404
+    client.patch('/api/me', headers=candidate, json={'display_name': 'Candidate', 'discoverable': True})
+    assert client.put(note_path, headers=member, json={'revision': 0, 'text': 'Private review note'}).status_code == 200
+    assert client.put(note_path, headers=member, json={'revision': 0, 'text': 'Overwrite'}).status_code == 409
+    assert client.put(path + '/comparison', headers=member, json={'revision': 0, 'candidate_ids': [cid]}).status_code == 200
+    workspace = client.get(path, headers=owner).json()
+    assert workspace['profiles'][0]['note'] == 'Private review note'
+    assert workspace['candidate_ids'] == [cid]
+    assert 'Private review note' not in client.get('/api/me', headers=candidate).text
+    client.patch('/api/me', headers=candidate, json={'display_name': 'Hidden candidate', 'discoverable': False})
+    withdrawn = client.get(path, headers=member).json()
+    assert withdrawn['profiles'] == [] and withdrawn['candidate_ids'] == [] and withdrawn['unavailable_count'] == 1
+    assert 'Private review note' not in str(withdrawn)
+    assert client.delete(note_path, headers=member).status_code == 200
+    assert client.get(path, headers=owner).json()['unavailable_count'] == 0
+    assert client.put(path + '/members/' + str(mid), headers=owner, json={'role': 'administrator'}).status_code == 200
+    assert client.post(path + '/invitations', headers=member, json={'email': 'another@example.test', 'role': 'administrator'}).status_code == 403
+    pending = client.post(path + '/invitations', headers=owner, json={'email': 'org-member@example.test'}).json()
+    assert client.delete(path + '/members/' + str(mid), headers=owner).status_code == 200
+    assert client.get(path, headers=member).status_code == 404
+    assert client.put(note_path, headers=member, json={'revision': 1, 'text': 'Unauthorized'}).status_code == 404
+    assert client.post('/api/organizations/accept', headers=member, json={'token': pending['token']}).status_code == 404
+    assert client.get('/api/organizations', headers=member).json() == []
+
+def test_question_versions_freeze_grading_and_require_reviewer_confirmation(client):
+    candidate = account(client, 'quality-candidate@example.test', 'quality-candidate')
+    editor = account(client, 'quality-editor@example.test', 'quality-editor')
+    async def grant():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("UPDATE users SET role='reviewer' WHERE email='quality-editor@example.test'")
+    client.portal.call(grant)
+    root = '/api/assessment-quality/docker'
+    assert client.get(root + '/catalog', headers=candidate).status_code == 403
+    active = client.post('/api/challenges/docker/attempts', headers=candidate).json()
+    assert all('answer' not in q for q in active['questions'])
+    config = client.get(root + '/catalog', headers=editor).json()
+    old_answer = config['questions'][0]['answer']
+    config['questions'][0]['answer'] = (old_answer + 1) % 4
+    config['questions'][0]['prompt'] = 'Revised fixture question wording'
+    body = {**config, 'reason': 'Synthetic scoring-key revision for isolated verification', 'confirm_publication': False}
+    assert client.post(root + '/versions', headers=editor, json=body).status_code == 400
+    body['confirm_publication'] = True
+    assert client.post(root + '/versions', headers=editor, json=body).status_code == 201
+    assert client.post(root + '/versions', headers=editor, json=body).status_code == 409
+    from app.domain import CATALOG
+    answers = {str(i): q[2] for i, q in enumerate(CATALOG['docker'][2])}
+    graded = client.post('/api/attempts/' + active['id'] + '/submit', headers=candidate, json={'answers': answers})
+    assert graded.status_code == 200 and graded.json()['correct_count'] == 5
+    next_attempt = client.post('/api/challenges/docker/attempts', headers=candidate).json()
+    assert any(q['prompt'] == 'Revised fixture question wording' for q in next_attempt['questions'])
+    next_grade = client.post('/api/attempts/' + next_attempt['id'] + '/submit', headers=candidate, json={'answers': answers})
+    assert next_grade.json()['correct_count'] == 4
+    assert client.get(root + '/report', headers=candidate).status_code == 403
+    report = client.get(root + '/report', headers=editor).json()
+    assert report['suppressed'] and 'items' not in report
+    assert len(report['input_sha256']) == 64
+    config = client.get(root + '/catalog', headers=editor).json()
+    config['questions'][0]['retired'] = True
+    assert client.post(root + '/versions', headers=editor, json={**config, 'reason': 'Retire fixture question pending human revision', 'confirm_publication': True}).status_code == 201
+    assert client.post('/api/challenges/docker/attempts', headers=candidate).status_code == 409
+    replay = client.post('/api/attempts/' + active['id'] + '/submit', headers=candidate, json={'answers': answers})
+    assert replay.json()['correct_count'] == 5
+
+def test_private_portability_archive_files_retry_and_retention(client):
+    import io, json, hashlib, time, zipfile
+    from pathlib import Path
+    from app.config import settings
+    from app.portability import work_once
+    owner = account(client, 'export-owner@example.test', 'export-owner')
+    other = account(client, 'export-other@example.test', 'export-other')
+    evidence = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Owned proof', 'url': 'https://example.test/owned', 'detail': {}}).json()['id']
+    proof = b'%PDF-1.4\nSynthetic portability fixture\n%%EOF'
+    assert client.post('/api/evidence/' + evidence + '/file', headers=owner, files={'file': ('proof.pdf', proof, 'application/pdf')}).status_code == 200
+    assert client.put('/api/portability/retention', headers=owner, json={'export_days': 1}).status_code == 200
+    response = client.post('/api/portability/exports', headers=owner)
+    assert response.status_code == 202
+    jid = response.json()['id']
+    def wait_status(expected):
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            client.portal.call(work_once)
+            jobs = client.get('/api/portability', headers=owner).json()['jobs']
+            status = next(r for r in jobs if r['id'] == jid)
+            if status['status'] == expected: return status
+            if status['status'] == 'failed' and expected != 'failed': pytest.fail(status['error'])
+            time.sleep(.1)
+        pytest.fail('Archive did not reach ' + expected)
+    ready = wait_status('ready')
+    path = '/api/portability/exports/' + jid + '/download'
+    assert client.get(path, headers=other).status_code == 404
+    payload = client.get(path, headers=owner).content
+    assert hashlib.sha256(payload).hexdigest() == ready['sha256']
+    with zipfile.ZipFile(io.BytesIO(payload)) as bundle:
+        records = json.loads(bundle.read('records.json'))
+        manifest = json.loads(bundle.read('manifest.json'))
+        assert records['users'][0]['email'] == 'export-owner@example.test'
+        assert len(records['users']) == 1
+        assert 'password_hash' not in records['users'][0]
+        assert 'sessions' not in records and 'oauth_states' not in records
+        assert 'storage_key' not in records['evidence'][0]
+        entry = manifest['files'][0]
+        assert bundle.read(entry['archive_path']) == proof
+        assert hashlib.sha256(proof).hexdigest() == entry['sha256']
+        assert hashlib.sha256(bundle.read('records.json')).hexdigest() == manifest['records_sha256']
+    async def interrupt():
+        from app.platform import db
+        async with db() as c: await c.execute("UPDATE portability_jobs SET status='running' WHERE id=$1", jid)
+    client.portal.call(interrupt)
+    wait_status('ready')
+    async def expire():
+        from app.platform import db
+        async with db() as c: await c.execute("UPDATE portability_jobs SET expires_at=NOW()-INTERVAL '1 minute' WHERE id=$1", jid)
+    client.portal.call(expire)
+    wait_status('expired')
+    assert client.get(path, headers=owner).status_code == 404
+    assert not (Path(settings.storage_path) / 'exports' / (jid + '.zip')).exists()
+    assert client.get('/api/portability', headers=other).json()['jobs'] == []
+    async def source_key():
+        from app.platform import db
+        async with db() as c:
+            return await c.fetchval('SELECT storage_key FROM evidence WHERE id=$1', evidence)
+    source_path = (Path(settings.storage_path) / client.portal.call(source_key)).resolve()
+    assert source_path.is_relative_to(Path(settings.storage_path).resolve())
+    source_path.unlink()
+    jid = client.post('/api/portability/exports', headers=owner).json()['id']
+    wait_status('failed')
+    source_path.write_bytes(proof)
+    assert client.post('/api/portability/exports/' + jid + '/retry', headers=owner).status_code == 200
+    wait_status('ready')
+
+
+def test_account_deletion_reauth_revocation_files_and_restore_tombstone(client):
+    import time
+    from pathlib import Path
+    from app.config import settings
+    from app.account_deletion import deletion_once, apply_tombstones
+    owner = account(client, 'delete-owner@example.test', 'delete-owner')
+    other = account(client, 'delete-other@example.test', 'delete-other')
+    uid = client.get('/api/me', headers=owner).json()['profile']['id']
+    source = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Delete fixture', 'url': 'https://example.test/source', 'detail': {}}).json()['id']
+    assert client.post('/api/evidence/' + source + '/file', headers=owner, files={'file': ('proof.pdf', b'%PDF-1.4 deletion fixture', 'application/pdf')}).status_code == 200
+    client.patch('/api/me', headers=owner, json={'display_name': 'Delete fixture', 'discoverable': True})
+    share = client.post('/api/shares', headers=owner).json()['id']
+    async def before():
+        from app.platform import db
+        async with db() as c:
+            return dict(await c.fetchrow('SELECT * FROM users WHERE id=$1', uid)), await c.fetchval('SELECT storage_key FROM evidence WHERE id=$1', source)
+    restored, key = client.portal.call(before)
+    preview = client.get('/api/account-deletion/preview', headers=owner).json()
+    request = {'preview_sha256': preview['preview_sha256'], 'password': 'wrong-password', 'confirmation': 'DELETE MY ACCOUNT'}
+    assert client.post('/api/account-deletion', headers=owner, json=request).status_code == 403
+    request['password'] = 'integration-password-123'
+    started = client.post('/api/account-deletion', headers=owner, json=request)
+    assert started.status_code == 202, started.text
+    receipt = {k: started.json()[k] for k in ('id','receipt')}
+    assert client.get('/api/me', headers=owner).status_code == 401
+    assert client.get('/api/share/' + share).status_code == 404
+    assert client.post('/api/auth/login', json={'email': 'delete-owner@example.test', 'password': 'integration-password-123'}).status_code == 401
+    assert client.post('/api/account-deletion/status', json={**receipt, 'receipt': 'x'*32}).status_code == 404
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        client.portal.call(deletion_once)
+        status = client.post('/api/account-deletion/status', json=receipt).json()
+        if status['status'] == 'completed': break
+        if status['status'] == 'failed': pytest.fail(status['error'])
+        time.sleep(.1)
+    assert status['status'] == 'completed'
+    assert not (Path(settings.storage_path) / key).exists()
+    assert client.get('/api/me', headers=other).status_code == 200
+    async def restore_fixture():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("INSERT INTO users(id,handle,email,display_name,password_hash,account_key,account_state,discoverable) VALUES($1,$2,$3,$4,$5,$6,'active',TRUE)", uid, restored['handle'], restored['email'], restored['display_name'], restored['password_hash'], restored['account_key'])
+            await c.execute("INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,NOW()+INTERVAL '1 day')", 'restore-token-fixture', uid)
+    client.portal.call(restore_fixture)
+    client.portal.call(apply_tombstones)
+    async def inspect_restore():
+        from app.platform import db
+        async with db() as c:
+            return await c.fetchval('SELECT account_state FROM users WHERE id=$1', uid), await c.fetchval('SELECT COUNT(*) FROM sessions WHERE user_id=$1', uid)
+    state, sessions = client.portal.call(inspect_restore)
+    assert state in ('deleting', None) and sessions == 0
+    client.portal.call(deletion_once)
+
+def test_organization_owner_must_transfer_before_deletion(client):
+    owner = account(client, 'owner-transfer@example.test', 'owner-transfer')
+    member = account(client, 'member-transfer@example.test', 'member-transfer')
+    mid = client.get('/api/me', headers=member).json()['profile']['id']
+    oid = client.post('/api/organizations', headers=owner, json={'name': 'Transfer fixture'}).json()['id']
+    path = '/api/organizations/' + oid
+    token = client.post(path + '/invitations', headers=owner, json={'email': 'member-transfer@example.test'}).json()['token']
+    client.post('/api/organizations/accept', headers=member, json={'token': token})
+    preview = client.get('/api/account-deletion/preview', headers=owner).json()
+    assert preview['owned_organizations'][0]['id'] == oid
+    body = {'preview_sha256': preview['preview_sha256'], 'password': 'integration-password-123', 'confirmation': 'DELETE MY ACCOUNT'}
+    assert client.post('/api/account-deletion', headers=owner, json=body).status_code == 409
+    assert client.post(path + '/transfer-owner', headers=member, json={'new_owner_id': mid, 'confirm_transfer': True}).status_code == 403
+    assert client.post(path + '/transfer-owner', headers=owner, json={'new_owner_id': mid, 'confirm_transfer': True}).status_code == 200
+    assert client.get(path, headers=member).json()['role'] == 'owner'
+    preview = client.get('/api/account-deletion/preview', headers=owner).json()
+    assert preview['owned_organizations'] == []
+    body['preview_sha256'] = preview['preview_sha256']
+    response = client.post('/api/account-deletion', headers=owner, json=body)
+    assert response.status_code == 202
+    from app.account_deletion import deletion_once
+    client.portal.call(deletion_once)
+    assert client.get(path, headers=member).status_code == 200
+
+def test_deletion_recovery_migration_and_write_guards(client):
+    from app.account_deletion import deletion_once
+    from app.db import run_migrations
+    owner = account(client, 'delete-recover@example.test', 'delete-recover')
+    uid = client.get('/api/me', headers=owner).json()['profile']['id']
+    source = client.post('/api/evidence', headers=owner, json={'kind': 'certificate', 'title': 'Recovery source', 'url': 'https://example.test/recovery', 'detail': {}}).json()['id']
+    async def hold_worker():
+        from app.db import get_conn
+        c = await get_conn()
+        await c.execute('SELECT pg_advisory_lock(73722903)')
+        return c
+    held = client.portal.call(hold_worker)
+    try:
+        preview = client.get('/api/account-deletion/preview', headers=owner).json()
+        response = client.post('/api/account-deletion', headers=owner, json={'preview_sha256': preview['preview_sha256'], 'password': 'integration-password-123', 'confirmation': 'DELETE MY ACCOUNT'})
+        assert response.status_code == 202
+        client.portal.call(run_migrations)
+        async def rejected_writes():
+            from app.platform import db
+            import asyncpg
+            async with db() as c:
+                with pytest.raises(asyncpg.RaiseError):
+                    await c.execute("INSERT INTO activity(user_id,kind,message) VALUES($1,'late','late in-flight write')", uid)
+                with pytest.raises(asyncpg.RaiseError):
+                    await c.execute('UPDATE users SET discoverable=TRUE WHERE id=$1', uid)
+                return await c.fetchval('SELECT account_state FROM users WHERE id=$1', uid)
+        assert client.portal.call(rejected_writes) == 'deleting'
+    finally:
+        async def release_worker():
+            from app.db import release_conn
+            await held.execute('SELECT pg_advisory_unlock(73722903)')
+            await release_conn(held)
+        client.portal.call(release_worker)
+    client.portal.call(deletion_once)
+    receipt = {k: response.json()[k] for k in ('id','receipt')}
+    assert client.post('/api/account-deletion/status', json=receipt).json()['status'] == 'completed'

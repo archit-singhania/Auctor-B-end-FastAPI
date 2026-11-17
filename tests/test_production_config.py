@@ -12,6 +12,7 @@ def production(tmp_path, **changes):
         public_api_url='https://api.example.org', web_url='https://web.example.org',
         allowed_origins='https://web.example.org',
         storage_volume_path=str(tmp_path), storage_path=str(tmp_path / 'private'),
+        deletion_ledger_path=str(tmp_path / 'deletion-ledger'),
         github_client_id='', github_client_secret='',
     )
     config.update(changes)
@@ -34,6 +35,8 @@ def test_production_refuses_relative_missing_or_outside_private_volume(tmp_path)
         {'storage_volume_path': ''}, {'storage_path': '_data'},
         {'storage_volume_path': str(tmp_path / 'not-mounted')},
         {'storage_path': str(tmp_path.parent / 'outside-private-volume')},
+        {'deletion_ledger_path': ''},
+        {'deletion_ledger_path': str(tmp_path.parent / 'outside-ledger')},
     ):
         with pytest.raises(RuntimeError):
             production(tmp_path, railway_volume_mount_path='', **changes).validate_deployment()

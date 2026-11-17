@@ -168,3 +168,125 @@ CREATE TABLE IF NOT EXISTS auctor.recruiter_integrations (id TEXT PRIMARY KEY,us
 CREATE TABLE IF NOT EXISTS auctor.integration_outbox (event_id TEXT PRIMARY KEY,integration_id TEXT NOT NULL REFERENCES auctor.recruiter_integrations(id) ON DELETE CASCADE,payload JSONB NOT NULL,status TEXT NOT NULL DEFAULT 'queued',attempts INT NOT NULL DEFAULT 0,last_error TEXT,next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),delivered_at TIMESTAMPTZ);
 CREATE INDEX IF NOT EXISTS outbox_delivery_idx ON auctor.integration_outbox(status,next_attempt_at);
 INSERT INTO auctor.schema_versions(version) VALUES (8) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.collection_links (user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE, claim_key TEXT NOT NULL, evidence_id TEXT NOT NULL REFERENCES auctor.evidence(id) ON DELETE CASCADE, PRIMARY KEY(user_id,claim_key,evidence_id));
+
+CREATE TABLE IF NOT EXISTS auctor.job_applications (
+ id TEXT PRIMARY KEY, user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,
+ revision INT NOT NULL, data JSONB NOT NULL, updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS auctor.application_snapshots (
+ application_id TEXT NOT NULL REFERENCES auctor.job_applications(id) ON DELETE CASCADE,
+ revision INT NOT NULL, data JSONB NOT NULL, sha256 TEXT NOT NULL,
+ created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), PRIMARY KEY(application_id,revision)
+);
+INSERT INTO auctor.schema_versions(version) VALUES (9) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.case_study_drafts (user_id INT PRIMARY KEY REFERENCES auctor.users(id) ON DELETE CASCADE,data JSONB NOT NULL);
+CREATE TABLE IF NOT EXISTS auctor.case_study_revisions (user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,revision INT NOT NULL,data JSONB NOT NULL,PRIMARY KEY(user_id,revision));
+CREATE TABLE IF NOT EXISTS auctor.case_study_publications (share_id TEXT PRIMARY KEY REFERENCES auctor.shares(id) ON DELETE CASCADE,data JSONB NOT NULL);
+INSERT INTO auctor.schema_versions(version) VALUES (10) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.analytics_settings (user_id INT PRIMARY KEY REFERENCES auctor.users(id) ON DELETE CASCADE,enabled BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE IF NOT EXISTS auctor.analytics_daily (user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,day DATE NOT NULL,kind TEXT NOT NULL,count BIGINT NOT NULL,PRIMARY KEY(user_id,day,kind));
+CREATE TABLE IF NOT EXISTS auctor.analytics_bursts (user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,resource TEXT NOT NULL,last_counted TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(user_id,resource));
+INSERT INTO auctor.schema_versions(version) VALUES (11) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.recruiter_exploration (user_id INT PRIMARY KEY REFERENCES auctor.users(id) ON DELETE CASCADE,revision INT NOT NULL,data JSONB NOT NULL);
+INSERT INTO auctor.schema_versions(version) VALUES (12) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.evidence_lineage_snapshots (
+ id BIGSERIAL PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,
+ evidence_id TEXT NOT NULL,operation TEXT NOT NULL,payload JSONB NOT NULL,canonical_text TEXT NOT NULL,
+ sha256 TEXT NOT NULL,captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ UNIQUE(user_id,evidence_id,operation,sha256)
+);
+CREATE OR REPLACE FUNCTION auctor.capture_evidence_lineage() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE item jsonb; canonical text; owner_id integer; source_id text;
+BEGIN
+ IF TG_OP='DELETE' THEN item=to_jsonb(OLD); ELSE item=to_jsonb(NEW); END IF;
+ owner_id=(item->>'user_id')::integer; source_id=item->>'id';
+ IF NOT EXISTS(SELECT 1 FROM auctor.users WHERE id=owner_id) THEN RETURN NULL; END IF;
+ item=item-'storage_key'; canonical=item::text;
+ INSERT INTO auctor.evidence_lineage_snapshots(user_id,evidence_id,operation,payload,canonical_text,sha256)
+ VALUES(owner_id,source_id,TG_OP,item,canonical,encode(sha256(convert_to(canonical,'UTF8')),'hex')) ON CONFLICT DO NOTHING;
+ RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS evidence_lineage_capture ON auctor.evidence;
+CREATE TRIGGER evidence_lineage_capture AFTER INSERT OR UPDATE OR DELETE ON auctor.evidence FOR EACH ROW EXECUTE FUNCTION auctor.capture_evidence_lineage();
+INSERT INTO auctor.evidence_lineage_snapshots(user_id,evidence_id,operation,payload,canonical_text,sha256)
+SELECT e.user_id,e.id,'MIGRATION_BASELINE',to_jsonb(e)-'storage_key',(to_jsonb(e)-'storage_key')::text,
+ encode(sha256(convert_to((to_jsonb(e)-'storage_key')::text,'UTF8')),'hex') FROM auctor.evidence e
+WHERE NOT EXISTS(SELECT 1 FROM auctor.evidence_lineage_snapshots s WHERE s.user_id=e.user_id AND s.evidence_id=e.id)
+ON CONFLICT DO NOTHING;
+INSERT INTO auctor.schema_versions(version) VALUES (13) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.disputes (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,evidence_id TEXT NOT NULL,reviewer_id INT REFERENCES auctor.users(id),state TEXT NOT NULL DEFAULT 'open',revision INT NOT NULL DEFAULT 1,data JSONB NOT NULL,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+CREATE TABLE IF NOT EXISTS auctor.dispute_audit (id BIGSERIAL PRIMARY KEY,dispute_id TEXT NOT NULL REFERENCES auctor.disputes(id) ON DELETE CASCADE,actor_id INT REFERENCES auctor.users(id),revision INT NOT NULL,action TEXT NOT NULL,note TEXT NOT NULL,reviewer_id INT REFERENCES auctor.users(id),created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+INSERT INTO auctor.schema_versions(version) VALUES (14) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.organizations (id TEXT PRIMARY KEY,name TEXT NOT NULL,revision INT NOT NULL DEFAULT 0,candidate_ids JSONB NOT NULL DEFAULT '[]');
+CREATE TABLE IF NOT EXISTS auctor.organization_members (organization_id TEXT NOT NULL REFERENCES auctor.organizations(id) ON DELETE CASCADE,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,role TEXT NOT NULL,PRIMARY KEY(organization_id,user_id));
+CREATE TABLE IF NOT EXISTS auctor.organization_invites (id TEXT PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES auctor.organizations(id) ON DELETE CASCADE,email TEXT NOT NULL,role TEXT NOT NULL,token_hash TEXT NOT NULL UNIQUE,expires_at TIMESTAMPTZ NOT NULL,accepted BOOLEAN NOT NULL DEFAULT FALSE,revoked BOOLEAN NOT NULL DEFAULT FALSE);
+CREATE TABLE IF NOT EXISTS auctor.organization_profiles (organization_id TEXT NOT NULL REFERENCES auctor.organizations(id) ON DELETE CASCADE,candidate_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,note TEXT NOT NULL,revision INT NOT NULL,PRIMARY KEY(organization_id,candidate_id));
+CREATE TABLE IF NOT EXISTS auctor.organization_audit (id BIGSERIAL PRIMARY KEY,organization_id TEXT NOT NULL REFERENCES auctor.organizations(id) ON DELETE CASCADE,actor_id INT REFERENCES auctor.users(id) ON DELETE SET NULL,action TEXT NOT NULL,target TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+INSERT INTO auctor.schema_versions(version) VALUES (15) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.assessment_versions (badge_id TEXT NOT NULL,version INT NOT NULL,data JSONB NOT NULL,reviewer_id INT NOT NULL REFERENCES auctor.users(id),reason TEXT NOT NULL,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),PRIMARY KEY(badge_id,version));
+ALTER TABLE auctor.attempts ADD COLUMN IF NOT EXISTS question_snapshot JSONB;
+INSERT INTO auctor.schema_versions(version) VALUES (16) ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS auctor.portability_preferences (user_id INT PRIMARY KEY REFERENCES auctor.users(id) ON DELETE CASCADE,export_days INT NOT NULL DEFAULT 7);
+CREATE TABLE IF NOT EXISTS auctor.portability_jobs (id TEXT PRIMARY KEY,user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'queued',error TEXT,sha256 TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),expires_at TIMESTAMPTZ NOT NULL);
+INSERT INTO auctor.schema_versions(version) VALUES (17) ON CONFLICT DO NOTHING;
+
+ALTER TABLE auctor.users ADD COLUMN IF NOT EXISTS account_key TEXT NOT NULL DEFAULT md5(random()::text || clock_timestamp()::text);
+CREATE UNIQUE INDEX IF NOT EXISTS users_account_key_idx ON auctor.users(account_key);
+ALTER TABLE auctor.users ADD COLUMN IF NOT EXISTS account_state TEXT NOT NULL DEFAULT 'active';
+CREATE TABLE IF NOT EXISTS auctor.owned_assets (user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,storage_key TEXT NOT NULL,PRIMARY KEY(user_id,storage_key));
+INSERT INTO auctor.owned_assets(user_id,storage_key) SELECT user_id,storage_key FROM auctor.documents WHERE storage_key IS NOT NULL ON CONFLICT DO NOTHING;
+INSERT INTO auctor.owned_assets(user_id,storage_key) SELECT user_id,storage_key FROM auctor.evidence WHERE storage_key IS NOT NULL ON CONFLICT DO NOTHING;
+CREATE OR REPLACE FUNCTION auctor.remember_owned_asset() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP!='INSERT' AND OLD.storage_key IS NOT NULL AND EXISTS(SELECT 1 FROM auctor.users WHERE id=OLD.user_id) THEN
+  INSERT INTO auctor.owned_assets(user_id,storage_key) VALUES(OLD.user_id,OLD.storage_key) ON CONFLICT DO NOTHING;
+ END IF;
+ IF TG_OP!='DELETE' AND NEW.storage_key IS NOT NULL THEN
+  INSERT INTO auctor.owned_assets(user_id,storage_key) VALUES(NEW.user_id,NEW.storage_key) ON CONFLICT DO NOTHING;
+ END IF;
+ RETURN NULL;
+END $$;
+DROP TRIGGER IF EXISTS remember_document_asset ON auctor.documents;
+CREATE TRIGGER remember_document_asset AFTER INSERT OR UPDATE OR DELETE ON auctor.documents FOR EACH ROW EXECUTE FUNCTION auctor.remember_owned_asset();
+DROP TRIGGER IF EXISTS remember_evidence_asset ON auctor.evidence;
+CREATE TRIGGER remember_evidence_asset AFTER INSERT OR UPDATE OR DELETE ON auctor.evidence FOR EACH ROW EXECUTE FUNCTION auctor.remember_owned_asset();
+CREATE TABLE IF NOT EXISTS auctor.account_deletions (id TEXT PRIMARY KEY,account_key TEXT NOT NULL UNIQUE,user_id INT NOT NULL,status TEXT NOT NULL DEFAULT 'queued',receipt_hash TEXT NOT NULL,attempts INT NOT NULL DEFAULT 0,error TEXT,counts JSONB NOT NULL DEFAULT '{}',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());
+-- Retain decisions belonging to other accounts without retaining the deleted reviewer's identity.
+DO $$ DECLARE r record; BEGIN
+ FOR r IN SELECT c.conname,c.conrelid::regclass AS tbl,a.attname FROM pg_constraint c JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1] WHERE c.contype='f' AND c.confrelid='auctor.users'::regclass AND array_length(c.conkey,1)=1 AND a.attname IN ('reviewer_id','actor_id') AND c.confdeltype='a' LOOP
+  EXECUTE format('ALTER TABLE %s ALTER COLUMN %I DROP NOT NULL',r.tbl,r.attname);
+  EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I',r.tbl,r.conname);
+  EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I FOREIGN KEY(%I) REFERENCES auctor.users(id) ON DELETE SET NULL',r.tbl,r.conname,r.attname);
+ END LOOP;
+END $$;
+INSERT INTO auctor.schema_versions(version) VALUES (18) ON CONFLICT DO NOTHING;
+
+CREATE OR REPLACE FUNCTION auctor.reject_disabled_account_write() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF current_setting('app.privacy_purge',true)='on' THEN RETURN NEW; END IF;
+ IF (SELECT account_state FROM auctor.users WHERE id=NEW.user_id) IS DISTINCT FROM 'active' THEN RAISE EXCEPTION 'Account is unavailable for writes'; END IF;
+ RETURN NEW;
+END $$;
+DO $$ DECLARE r record; BEGIN
+ FOR r IN SELECT DISTINCT c.conrelid::regclass AS tbl FROM pg_constraint c JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=c.conkey[1] WHERE c.contype='f' AND c.confrelid='auctor.users'::regclass AND array_length(c.conkey,1)=1 AND a.attname='user_id' LOOP
+  EXECUTE format('DROP TRIGGER IF EXISTS active_account_write ON %s',r.tbl);
+  EXECUTE format('CREATE TRIGGER active_account_write BEFORE INSERT OR UPDATE ON %s FOR EACH ROW EXECUTE FUNCTION auctor.reject_disabled_account_write()',r.tbl);
+ END LOOP;
+END $$;
+CREATE OR REPLACE FUNCTION auctor.protect_disabled_account() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF OLD.account_state!='active' AND current_setting('app.privacy_purge',true) IS DISTINCT FROM 'on' THEN RAISE EXCEPTION 'Account is unavailable for writes'; END IF;
+ RETURN NEW;
+END $$;
+DROP TRIGGER IF EXISTS disabled_account_write ON auctor.users;
+CREATE TRIGGER disabled_account_write BEFORE UPDATE ON auctor.users FOR EACH ROW EXECUTE FUNCTION auctor.protect_disabled_account();
