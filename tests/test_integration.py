@@ -146,7 +146,7 @@ def test_reviewer_and_discovery_privacy(client):
     assert len(listed.json())==1
     assert client.get('/api/export?format=pdf',headers=dev).content.startswith(b'%PDF-')
     assert client.get('/api/badge/proof-developer.svg').status_code==200
-    assert client.get('/health').json()['schema_version']==18
+    assert client.get('/health').json()['schema_version']==19
 
 def test_oauth_ownership_and_project_binding(client,monkeypatch):
     import httpx
@@ -425,10 +425,16 @@ def test_recruiter_presentation_review_scope_expiry_revocation_and_pdf(client):
     assert client.post('/api/presentations/shares',headers=other,json={**publish,'confirm_public':True}).status_code==409
     published=client.post('/api/presentations/shares',headers=owner,json={**publish,'confirm_public':True});assert published.status_code==201,published.text
     sid=published.json()['id'];assert client.get('/api/share/'+sid).status_code==404
-    assert client.get('/api/presentations/shared/'+sid).status_code==200
+    public = client.get('/api/presentations/shared/'+sid)
+    assert public.status_code == 200
+    assert '_source_bindings' not in public.json()
+    lineage = client.get('/api/lineage/'+evidence, headers=owner).json()
+    refs = [item for item in lineage['downstream'] if item['kind'] == 'recruiter_presentation']
+    assert refs[0]['id'] == sid
+    assert refs[0]['source_revision_ids'] == [lineage['revisions'][-1]['id']]
+    assert client.get('/api/lineage/'+evidence, headers=other).status_code == 404
     pdf=client.get('/api/presentations/shared/'+sid+'/brief.pdf');assert pdf.status_code==200 and pdf.content.startswith(b'%PDF-')
     text=extract_text(io.BytesIO(pdf.content));assert 'Selected recruiter story' in text and 'Selected service' in text and 'SECRET' not in text
-    output=__import__('pathlib').Path('../Auctor-F-end-Flutter/output/pdf');output.mkdir(parents=True,exist_ok=True);(output/'auctor-interview-brief.pdf').write_bytes(pdf.content)
     async def revoke_source():
         from app.platform import db
         async with db() as c:await c.execute("UPDATE evidence SET status='rejected' WHERE id=$1",evidence)
@@ -436,6 +442,19 @@ def test_recruiter_presentation_review_scope_expiry_revocation_and_pdf(client):
     data=client.get('/api/presentations/shared/'+sid).json();assert data['evidence']==[] and data['role_fit']['contributions'][0]['sources']==[]
     assert client.post('/api/presentations/shares',headers=owner,json={**publish,'confirm_public':True}).status_code==409
     assert client.delete('/api/shares/'+sid,headers=owner).status_code==200
+    history = client.get('/api/lineage/'+evidence, headers=owner).json()
+    historic = next(item for item in history['downstream'] if item['id'] == sid)
+    assert historic['revoked']
+    assert historic['source_revision_ids'] == refs[0]['source_revision_ids']
+    async def simulate_legacy_share():
+        from app.platform import db
+        async with db() as c:
+            await c.execute("UPDATE recruiter_presentation_shares SET data=data-'_source_bindings' WHERE share_id=$1", sid)
+    client.portal.call(simulate_legacy_share)
+    legacy = client.get('/api/lineage/'+evidence, headers=owner).json()
+    older = next(item for item in legacy['downstream'] if item['id'] == sid)
+    assert older['source_revision_ids'] == []
+    assert 'exact source revision unavailable' in older['binding']
     assert client.get('/api/presentations/shared/'+sid+'/brief.pdf').status_code==404
     fresh=client.get('/api/presentations/preview',headers=owner).json();new=client.post('/api/presentations/shares',headers=owner,json={'revision':1,'preview_sha256':fresh['preview_sha256'],'confirm_public':True,'expires_days':1}).json()['id']
     async def expire():
@@ -551,6 +570,22 @@ def test_evidence_collection_owned_persistent_and_never_auto_verified(client):
     assert client.put('/api/cv', headers=owner, json={'data': cv}).status_code == 200
     assert client.post(link, headers=owner, json={'evidence_id': source}).status_code == 409
     assert client.get(path, headers=owner).json()['claims'][0]['linked'] == []
+    lineage = client.get('/api/lineage/'+source, headers=owner).json()
+    linked = next(item for item in lineage['downstream'] if item['kind'] == 'candidate_claim_link')
+    assert linked['id'] == claim['id']
+    assert [item['title'] for item in linked['matching_cv_revisions']] == ['Python']
+    assert linked['source_revision_ids'] == [lineage['revisions'][0]['id']]
+    assert linked['attachment']['claim_title'] == 'Python'
+    assert client.get('/api/lineage/'+source, headers=other).status_code == 404
+    async def withdraw_source():
+        from app.platform import db
+        async with db() as c:
+            await c.execute('DELETE FROM evidence WHERE id=$1', source)
+    client.portal.call(withdraw_source)
+    history = client.get('/api/lineage/'+source, headers=owner).json()
+    assert history['withdrawn']
+    assert next(item for item in history['downstream']
+                if item['kind'] == 'candidate_claim_link')['source_revision_ids'] == linked['source_revision_ids']
 
 def test_private_applications_snapshot_revisions_and_calendar(client):
     import uuid
@@ -743,6 +778,26 @@ def test_lineage_preserves_exact_source_and_publication_after_withdrawal(client)
     assert original in withdrawn['revisions']
     assert withdrawn['downstream'][0]['source_revision_ids'] == claim['source_revision_ids']
 
+    async def simulate_legacy_publication():
+        from app.platform import db
+        async with db() as c:
+            await c.execute(
+                """UPDATE case_study_publications
+                   SET data = data #- '{sections,0,evidence,0,source_revision}'
+                                   #- '{sections,0,evidence,0,snapshot_sha256}'
+                   WHERE share_id=$1""",
+                claim['id'],
+            )
+
+    client.portal.call(simulate_legacy_publication)
+    legacy = client.get(path, headers=owner)
+    assert legacy.status_code == 200
+    reference = next(r for r in legacy.json()['downstream'] if r['kind'] == 'published_claim')
+    assert reference['id'] == claim['id']
+    assert reference['source_revision_ids'] == []
+    assert 'exact source revision unavailable' in reference['binding']
+    assert client.get(path, headers=other).status_code == 404
+
 def test_dispute_independence_correction_stale_source_and_history(client):
     owner = account(client, 'appeal-owner@example.test', 'appeal-owner')
     first = account(client, 'appeal-first@example.test', 'appeal-first')
@@ -868,6 +923,19 @@ def test_question_versions_freeze_grading_and_require_reviewer_confirmation(clie
     report = client.get(root + '/report', headers=editor).json()
     assert report['suppressed'] and 'items' not in report
     assert len(report['input_sha256']) == 64
+    from app.platform import LIMITS
+    for index in range(19):
+        LIMITS.clear()
+        handle = f'quality-cohort-{index}'
+        member = account(client, handle+'@example.test', handle)
+        attempt = client.post('/api/challenges/docker/attempts', headers=member).json()
+        graded = client.post('/api/attempts/'+attempt['id']+'/submit', headers=member, json={'answers': answers})
+        assert graded.status_code == 200 and graded.json()['correct_count'] == 4
+    published_report = client.get(root + '/report', headers=editor).json()
+    assert published_report['eligible_completed'] == 20
+    assert not published_report['suppressed'] and published_report['unstable']
+    assert [item['observed_correct_fraction'] for item in published_report['items']] == [0, 1, 1, 1, 1]
+    assert client.get(root + '/report?version=1', headers=editor).json()['suppressed']
     config = client.get(root + '/catalog', headers=editor).json()
     config['questions'][0]['retired'] = True
     assert client.post(root + '/versions', headers=editor, json={**config, 'reason': 'Retire fixture question pending human revision', 'confirm_publication': True}).status_code == 201

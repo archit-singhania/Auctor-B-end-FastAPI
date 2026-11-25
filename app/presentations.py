@@ -52,6 +52,15 @@ async def projection(c,uid,value):
 
 def digest(value):return hashlib.sha256(json.dumps(value,sort_keys=True,separators=(',',':'),default=str).encode()).hexdigest()
 
+async def source_bindings(c, uid, data):
+    ids = [source['id'] for source in data['evidence']]
+    rows = await c.fetch(
+        """SELECT DISTINCT ON (evidence_id) evidence_id,id,sha256
+           FROM evidence_lineage_snapshots WHERE user_id=$1 AND evidence_id=ANY($2::text[])
+           ORDER BY evidence_id,id DESC""", uid, ids,
+    )
+    return {row['evidence_id']: {'revision_id': row['id'], 'sha256': row['sha256']} for row in rows}
+
 @router.get('')
 async def get_config(user=Depends(current_user)):
     async with db() as c:return await config(c,user['id'])
@@ -75,8 +84,10 @@ async def save(body:Presentation,user=Depends(current_user)):
 @router.get('/preview')
 async def preview(user=Depends(current_user)):
     async with db() as c:
-        value=await config(c,user['id']);data=await projection(c,user['id'],value)
-    return {'revision':value['revision'],'preview_sha256':digest(data),'data':data}
+        async with c.transaction(isolation='repeatable_read', readonly=True):
+            value=await config(c,user['id']);data=await projection(c,user['id'],value)
+            bindings = await source_bindings(c, user['id'], data)
+    return {'revision':value['revision'],'preview_sha256':digest([data, bindings]),'data':data}
 
 class Publish(BaseModel):
     revision:int=Field(ge=0)
@@ -90,10 +101,12 @@ async def publish(body:Publish,user=Depends(current_user)):
     async with db() as c:
         async with c.transaction(isolation='repeatable_read'):
             value=await config(c,user['id']);data=await projection(c,user['id'],value)
-            if value['revision']!=body.revision or digest(data)!=body.preview_sha256:raise HTTPException(409,'Presentation sources changed. Review the updated public preview')
+            bindings = await source_bindings(c, user['id'], data)
+            if value['revision']!=body.revision or digest([data, bindings])!=body.preview_sha256:raise HTTPException(409,'Presentation sources changed. Review the updated public preview')
             sid=secrets.token_urlsafe(24);expires=datetime.now(timezone.utc)+timedelta(days=body.expires_days)
             await c.execute("INSERT INTO shares(id,user_id,kind,expires_at) VALUES($1,$2,'presentation',$3)",sid,user['id'],expires)
             data['snapshot_at']=datetime.now(timezone.utc).isoformat()
+            data['_source_bindings'] = bindings
             await c.execute('INSERT INTO recruiter_presentation_shares(share_id,data) VALUES($1,$2::jsonb)',sid,json.dumps(data))
     from app.config import settings
     return {'id':sid,'expires_at':expires,'url':settings.web_url.rstrip('/')+'/#/presentation/'+sid}
@@ -102,6 +115,7 @@ async def shared(c,sid):
     found=await c.fetchrow("SELECT s.user_id,p.data FROM shares s JOIN recruiter_presentation_shares p ON p.share_id=s.id WHERE s.id=$1 AND s.kind='presentation' AND s.revoked=FALSE AND s.expires_at>NOW()",sid)
     if not found:raise HTTPException(404,'Presentation expired, revoked or unavailable')
     data=copy.deepcopy(decode(found['data']))
+    data.pop('_source_bindings', None)
     allowed={r['id'] for r in await c.fetch("SELECT id FROM evidence WHERE user_id=$1 AND status='verified' AND eligibility_state='current' AND (review_due_at IS NULL OR review_due_at>NOW())",found['user_id'])}
     data['evidence']=[e for e in data['evidence'] if e['id'] in allowed]
     for m in data['career_story']['milestones']:m['evidence']=[e for e in m['evidence'] if e['id'] in allowed]

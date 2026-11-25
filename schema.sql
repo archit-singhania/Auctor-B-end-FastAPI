@@ -271,6 +271,19 @@ DO $$ DECLARE r record; BEGIN
 END $$;
 INSERT INTO auctor.schema_versions(version) VALUES (18) ON CONFLICT DO NOTHING;
 
+CREATE TABLE IF NOT EXISTS auctor.claim_lineage_bindings (
+ user_id INT NOT NULL REFERENCES auctor.users(id) ON DELETE CASCADE,
+ evidence_id TEXT NOT NULL,
+ claim_key TEXT NOT NULL,
+ evidence_revision_id BIGINT NOT NULL REFERENCES auctor.evidence_lineage_snapshots(id) ON DELETE CASCADE,
+ claim_title TEXT NOT NULL,
+ claim_kind TEXT NOT NULL,
+ claim_origin TEXT NOT NULL,
+ linked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+ PRIMARY KEY(user_id,evidence_id,claim_key)
+);
+INSERT INTO auctor.schema_versions(version) VALUES (19) ON CONFLICT DO NOTHING;
+
 CREATE OR REPLACE FUNCTION auctor.reject_disabled_account_write() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
  IF current_setting('app.privacy_purge',true)='on' THEN RETURN NEW; END IF;

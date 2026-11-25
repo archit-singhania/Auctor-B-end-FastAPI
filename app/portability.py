@@ -14,7 +14,7 @@ from app.platform import current_user, db, decode
 from app.config import settings
 
 router = APIRouter(prefix='/api/portability', tags=['Account portability'])
-TABLES = ('users','cv_data','verifications','badges','scores','portability_preferences','documents','cv_versions','evidence','attempts','score_history','review_decisions','activity','shares','saved_candidates','career_stories','role_documents','role_fit_runs','evidence_snapshots','evidence_comparisons','practice_sessions','recruiter_presentations','verification_receipts','evidence_lifecycle_audit','evidence_rechecks','assessment_integrity_events','assessment_integrity_signals','recruiter_integrations','collection_links','job_applications','case_study_drafts','case_study_revisions','analytics_settings','analytics_daily','recruiter_exploration','evidence_lineage_snapshots','disputes','organization_members')
+TABLES = ('users','cv_data','verifications','badges','scores','portability_preferences','documents','cv_versions','evidence','attempts','score_history','review_decisions','activity','shares','saved_candidates','career_stories','role_documents','role_fit_runs','evidence_snapshots','evidence_comparisons','practice_sessions','recruiter_presentations','verification_receipts','evidence_lifecycle_audit','evidence_rechecks','assessment_integrity_events','assessment_integrity_signals','recruiter_integrations','collection_links','claim_lineage_bindings','job_applications','case_study_drafts','case_study_revisions','analytics_settings','analytics_daily','recruiter_exploration','evidence_lineage_snapshots','disputes','organization_members')
 SECRET_FIELDS = {'password_hash','token_hash','secret_cipher','storage_key','run_token','question_snapshot','canonical_text'}
 LIMIT = 256 * 1024 * 1024
 

@@ -66,8 +66,18 @@ async def attach(claim_id:str,body:Attachment,user=Depends(current_user)):
         async with c.transaction():
             uid=user['id']
             await c.fetchval('SELECT id FROM users WHERE id=$1 FOR UPDATE',uid)
-            if claim_id not in await owned_claims(c,uid):raise HTTPException(409,'Claim changed. Refresh the collection checklist.')
-            if not await c.fetchval('SELECT id FROM evidence WHERE id=$1 AND user_id=$2',body.evidence_id,uid):raise HTTPException(404,'Evidence unavailable.')
+            claim = (await owned_claims(c, uid)).get(claim_id)
+            if claim is None:raise HTTPException(409,'Claim changed. Refresh the collection checklist.')
+            if not await c.fetchval('SELECT id FROM evidence WHERE id=$1 AND user_id=$2 FOR SHARE',body.evidence_id,uid):raise HTTPException(404,'Evidence unavailable.')
             added=await c.fetchval('INSERT INTO collection_links(user_id,claim_key,evidence_id) VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING evidence_id',uid,claim_id,body.evidence_id)
-            if added:await event(c,uid,'collection_link','Candidate linked an existing source to a claim.')
+            if added:
+                await c.execute(
+                    """INSERT INTO claim_lineage_bindings
+                       (user_id,evidence_id,claim_key,evidence_revision_id,claim_title,claim_kind,claim_origin)
+                       SELECT $1,$2,$3,id,$4,$5,$6 FROM evidence_lineage_snapshots
+                       WHERE user_id=$1 AND evidence_id=$2 ORDER BY id DESC LIMIT 1
+                       ON CONFLICT DO NOTHING""",
+                    uid, body.evidence_id, claim_id, claim['title'], claim['kind'], claim['origin'],
+                )
+                await event(c,uid,'collection_link','Candidate linked an existing source to a claim.')
             return {'claim_id':claim_id,'evidence_id':body.evidence_id}
