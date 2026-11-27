@@ -98,9 +98,22 @@ async def trace(eid: str, user=Depends(current_user)):
                            'Historical presentation includes this evidence; exact source revision unavailable',
             })
         for r in await c.fetch('SELECT s.application_id,s.revision,s.data FROM application_snapshots s JOIN job_applications a ON a.id=s.application_id WHERE a.user_id=$1', uid):
-            for e in decode(r['data'])['evidence']:
-                if e['id'] == eid:
-                    references.append({'kind': 'application_snapshot', 'id': r['application_id'], 'revision': r['revision'], 'source_snapshot': e, 'binding': 'Stored immutable submission source snapshot'})
+            for e in decode(r['data']).get('evidence', []):
+                if e.get('id') != eid:
+                    continue
+                matches = publication_revision_ids({
+                    'source_revision': e.get('updated_at'),
+                    'snapshot_sha256': publication_hash(e),
+                }, revisions)
+                matches = [revision['id'] for revision in revisions
+                           if revision['id'] in matches
+                           and all(revision['payload'].get(key) == e.get(key) for key in ('url', 'detail'))]
+                references.append({
+                    'kind': 'application_snapshot', 'id': r['application_id'], 'revision': r['revision'],
+                    'source_snapshot': e, 'source_revision_ids': matches if len(matches) == 1 else [],
+                    'binding': 'Exact stored submission source revision' if len(matches) == 1 else
+                               'Stored immutable submission source snapshot; exact revision unavailable',
+                })
         bindings = {row['claim_key']: dict(row) for row in await c.fetch(
             """SELECT claim_key,evidence_revision_id,claim_title,claim_kind,claim_origin,linked_at
                FROM claim_lineage_bindings WHERE user_id=$1 AND evidence_id=$2""", uid, eid,

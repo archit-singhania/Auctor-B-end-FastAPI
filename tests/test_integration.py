@@ -39,6 +39,100 @@ def account(client,email,handle):
     assert response.status_code==201,response.text
     return {'Authorization':'Bearer '+response.json()['token']}
 
+
+def test_concurrent_profile_lineage_search_and_exports_preserve_ownership(client):
+    from concurrent.futures import ThreadPoolExecutor
+    from platform import platform, python_version
+    from statistics import median
+    from time import perf_counter
+
+    handles = [f'concurrent-reader-{index}' for index in range(8)]
+    sessions = [account(client, f'{handle}@example.test', handle) for handle in handles]
+    sources = []
+    for handle, session in zip(handles, sessions):
+        created = client.post('/api/evidence', headers=session, json={
+            'kind': 'certificate', 'title': handle, 'detail': {},
+            'url': 'https://example.test/fixture',
+        })
+        assert created.status_code == 201, created.text
+        sources.append(created.json()['id'])
+        role = client.put('/api/role-fit', headers=session, json={
+            'revision': 0, 'title': handle, 'description': 'Docker deployment',
+            'reviewed': True, 'requirements': [{'skill': 'Docker', 'priority': 'required'}],
+        })
+        assert role.status_code == 200, role.text
+
+    def exercise(owner):
+        timings = []
+        requests = {name: [] for name in ('write', 'read', 'lineage', 'search', 'export', 'role fit')}
+        role_hash = None
+
+        def measured(name, method, route, **options):
+            started = perf_counter()
+            response = method(route, **options)
+            requests[name].append((perf_counter() - started) * 1000)
+            return response
+
+        for revision in range(20):
+            started = perf_counter()
+            bio = f'Account {owner}, update {revision}'
+            response = measured('write', client.patch, '/api/me', headers=sessions[owner], json={
+                'display_name': handles[owner], 'bio': bio, 'discoverable': True,
+            })
+            assert response.status_code == 200, response.text
+            response = measured('read', client.get, '/api/me', headers=sessions[owner])
+            assert response.status_code == 200, response.text
+            profile = response.json()['profile']
+            assert profile['handle'] == handles[owner] and profile['bio'] == bio
+            lineage = measured('lineage', client.get, f'/api/lineage/{sources[owner]}', headers=sessions[owner])
+            assert lineage.status_code == 200, lineage.text
+            assert lineage.json()['revisions'][0]['payload']['title'] == handles[owner]
+            matches = measured('search', client.get, '/api/candidates', params={'q': handles[owner]},
+                                 headers=sessions[owner])
+            assert matches.status_code == 200, matches.text
+            assert [(item['profile']['handle'], item['evidence']) for item in matches.json()] == [
+                (handles[owner], []),
+            ]
+            exported = measured('export', client.get, '/api/export?format=json', headers=sessions[owner])
+            assert exported.status_code == 200, exported.text
+            assert exported.json()['profile']['handle'] == handles[owner]
+            assert exported.json()['evidence'] == []
+            fit = measured('role fit', client.post, '/api/role-fit/runs', headers=sessions[owner])
+            assert fit.status_code == 201, fit.text
+            result = fit.json()['result']
+            assert result['total_weight'] == 2
+            assert result['coverage_percent'] == 0
+            if role_hash is None:
+                role_hash = result['input_sha256']
+            assert result['input_sha256'] == role_hash
+            timings.append((perf_counter() - started) * 1000)
+        foreign = client.get(f'/api/lineage/{sources[(owner + 1) % len(sources)]}',
+                             headers=sessions[owner])
+        assert foreign.status_code == 404
+        pdf = client.get('/api/export?format=pdf', headers=sessions[owner])
+        assert pdf.status_code == 200 and pdf.content.startswith(b'%PDF-')
+        return timings, requests
+
+    workload_started = perf_counter()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        samples = list(pool.map(exercise, range(8)))
+    workload_seconds = perf_counter() - workload_started
+
+    def report(label, values):
+        values = sorted(values)
+        p95 = values[(95 * len(values) + 99) // 100 - 1]
+        print(f'{label} ({len(values)} samples): p50={median(values):.1f} ms, p95={p95:.1f} ms')
+
+    cycles = [ms for durations, _ in samples for ms in durations]
+    # Include the ownership and PDF checks that complete each account's run.
+    request_count = len(cycles) * len(samples[0][1]) + len(samples) * 2
+    print(f'{platform()}, Python {python_version()}, {os.cpu_count()} logical CPUs')
+    print(f'{request_count} requests in {workload_seconds:.2f} s ({request_count / workload_seconds:.1f} requests/s)')
+    report('Mixed six-request cycles across 8 owners', cycles)
+    for operation in samples[0][1]:
+        report(operation, [ms for _, requests in samples for ms in requests[operation]])
+
+
 def test_owned_insights_badge_details_certificate_issuer_and_durable_review_audit(client):
     owner=account(client,'insight-owner@example.test','insight-owner'); other=account(client,'insight-other@example.test','insight-other')
     reviewer=account(client,'insight-reviewer@example.test','insight-reviewer')
@@ -611,6 +705,13 @@ def test_private_applications_snapshot_revisions_and_calendar(client):
     first = client.post(snapshot_path, headers=owner, json={'revision': 2}).json()
     assert first['data']['cv']['skills'] == ['Python']
     assert first['data']['evidence'][0]['status'] == 'pending'
+    source = first['data']['evidence'][0]['id']
+    trace = client.get('/api/lineage/'+source, headers=owner)
+    assert trace.status_code == 200, trace.text
+    reference = next(item for item in trace.json()['downstream'] if item['kind'] == 'application_snapshot')
+    assert reference['binding'] == 'Exact stored submission source revision'
+    assert len(reference['source_revision_ids']) == 1
+    assert client.get('/api/lineage/'+source, headers=other).status_code == 404
     cv['skills'] = ['Java']
     client.put('/api/cv', headers=owner, json={'data': cv})
     assert client.post(snapshot_path, headers=owner, json={'revision': 2}).json() == first
@@ -625,6 +726,12 @@ def test_private_applications_snapshot_revisions_and_calendar(client):
     assert client.get(endpoint + '/' + data['id'] + '/calendar', headers=other).status_code == 404
     updated['interviews'][0]['starts_at'] = '2026-12-01T10:00:00'
     assert client.put(endpoint, headers=owner, json=updated).status_code == 422
+    withdrawn = client.delete('/api/evidence/'+source, headers=owner)
+    assert withdrawn.status_code == 200, withdrawn.text
+    historical = client.get('/api/lineage/'+source, headers=owner).json()
+    assert historical['withdrawn'] and not historical['currently_eligible']
+    archived_reference = next(item for item in historical['downstream'] if item['kind'] == 'application_snapshot')
+    assert archived_reference == reference
 
 def test_case_study_publication_redaction_snapshot_and_revocation(client):
     owner = account(client, 'case-owner@example.test', 'case-owner')
@@ -936,6 +1043,28 @@ def test_question_versions_freeze_grading_and_require_reviewer_confirmation(clie
     assert not published_report['suppressed'] and published_report['unstable']
     assert [item['observed_correct_fraction'] for item in published_report['items']] == [0, 1, 1, 1, 1]
     assert client.get(root + '/report?version=1', headers=editor).json()['suppressed']
+
+    from concurrent.futures import ThreadPoolExecutor
+    from statistics import median
+    from time import perf_counter
+
+    def read_reports(_):
+        started = perf_counter()
+        report = client.get(root + '/report', headers=editor)
+        assert report.status_code == 200, report.text
+        data = report.json()
+        assert data['eligible_completed'] == 20
+        assert data['input_sha256'] == published_report['input_sha256']
+        assert data['items'] == published_report['items']
+        elapsed = (perf_counter() - started) * 1000
+        assert client.get(root + '/report', headers=candidate).status_code == 403
+        return elapsed
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        report_times = sorted(pool.map(read_reports, range(64)))
+    p95 = report_times[(95 * len(report_times) + 99) // 100 - 1]
+    print(f'64 assessment reports at up to 8 concurrent workers: p50={median(report_times):.1f} ms, p95={p95:.1f} ms')
+
     config = client.get(root + '/catalog', headers=editor).json()
     config['questions'][0]['retired'] = True
     assert client.post(root + '/versions', headers=editor, json={**config, 'reason': 'Retire fixture question pending human revision', 'confirm_publication': True}).status_code == 201

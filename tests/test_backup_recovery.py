@@ -40,15 +40,6 @@ def test_restore_dump_and_replay_deletion(tmp_path, monkeypatch):
     def dsn(name):
         return urlunsplit(parsed._replace(path='/' + name))
 
-    def pg(tool, database, *args):
-        exe = Path(tool_dir) / (tool + ('.exe' if os.name == 'nt' else ''))
-        environment = {**os.environ, 'PGHOST': parsed.hostname,
-                       'PGPORT': str(parsed.port or 5432),
-                       'PGUSER': unquote(parsed.username or ''),
-                       'PGPASSWORD': unquote(parsed.password or '')}
-        subprocess.run([str(exe), '--no-password', '--dbname', database, *map(str, args)],
-                       env=environment, check=True, timeout=60)
-
     def register(client, handle):
         credentials = {'email': handle + '@example.test', 'password': 'recovery-password-123'}
         response = client.post('/api/auth/register', json={
@@ -59,8 +50,8 @@ def test_restore_dump_and_replay_deletion(tmp_path, monkeypatch):
 
     ledger = tmp_path / 'protected-ledger'
     live_assets = tmp_path / 'live-assets'
-    restored_assets = tmp_path / 'restored-assets'
-    archive = tmp_path / 'database.dump'
+    recovery = tmp_path / 'recovery'
+    restored_assets = recovery / 'assets'
     monkeypatch.setattr(settings, 'app_env', 'test')
     monkeypatch.setattr(settings, 'db_schema', 'auctor_recovery')
     monkeypatch.setattr(settings, 'deletion_ledger_path', str(ledger))
@@ -85,6 +76,16 @@ def test_restore_dump_and_replay_deletion(tmp_path, monkeypatch):
             uploaded = client.post(f'/api/evidence/{evidence}/file', headers=deleted,
                                    files={'file': ('proof.pdf', b'%PDF-1.4 recovery fixture', 'application/pdf')})
             assert uploaded.status_code == 200, uploaded.text
+            retained_evidence = client.post('/api/evidence', headers=retained, json={
+                'kind': 'certificate', 'title': 'Retained recovery proof', 'detail': {},
+                'url': 'https://example.test/retained',
+            })
+            assert retained_evidence.status_code == 201, retained_evidence.text
+            retained_file = '/api/evidence/' + retained_evidence.json()['id'] + '/file'
+            retained_bytes = b'%PDF-1.4 retained recovery fixture'
+            retained_upload = client.post(retained_file, headers=retained,
+                                          files={'file': ('proof.pdf', retained_bytes, 'application/pdf')})
+            assert retained_upload.status_code == 200, retained_upload.text
             assert client.get('/api/share/' + share).status_code == 200
         backups = tmp_path / 'backups'
         backups.mkdir()
@@ -104,16 +105,40 @@ def test_restore_dump_and_replay_deletion(tmp_path, monkeypatch):
             '--retention-days', '30',
         ], env=environment, check=True, timeout=60)
         assert not expired.exists() and unrelated.read_bytes() == b'keep'
-        with ZipFile(next(backups.glob('auctor-backup-*.zip'))) as bundle:
+        verified_archive = next(backups.glob('auctor-backup-*.zip'))
+        subprocess.run([
+            sys.executable, str(backup_script.with_name('verify_backup.py')),
+            str(backups), '--latest', '--max-age-hours', '25',
+        ], check=True, timeout=60)
+        corrupt = backups / ('auctor-backup-99991231T235959Z-' + '0' * 32 + '.zip')
+        corrupt.write_bytes(b'incomplete fixture')
+        try:
+            rejected = subprocess.run([
+                sys.executable, str(backup_script.with_name('verify_backup.py')),
+                str(backups), '--latest', '--max-age-hours', '25',
+            ], capture_output=True, text=True, timeout=60)
+            assert rejected.returncode == 1
+            assert 'not a zip file' in rejected.stderr.lower()
+        finally:
+            corrupt.unlink()
+        with ZipFile(verified_archive) as bundle:
             manifest = json.loads(bundle.read('manifest.json'))
             assert manifest['format_version'] == 1
             assert set(bundle.namelist()) == {*manifest['entries'], 'manifest.json'}
             for name, info in manifest['entries'].items():
                 content = bundle.read(name)
                 assert info == {'sha256': hashlib.sha256(content).hexdigest(), 'bytes': len(content)}
-                destination = archive if name == 'database.dump' else restored_assets / name.removeprefix('assets/')
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                destination.write_bytes(content)
+            stale_archive = tmp_path / 'stale.zip'
+            with ZipFile(stale_archive, 'w') as stale:
+                for name in manifest['entries']:
+                    stale.writestr(name, bundle.read(name))
+                stale.writestr('manifest.json', json.dumps({**manifest, 'created_at': '2020-01-01T00:00:00Z'}))
+        rejected = subprocess.run([
+            sys.executable, str(backup_script.with_name('verify_backup.py')),
+            str(stale_archive), '--max-age-hours', '25',
+        ], capture_output=True, text=True, timeout=60)
+        assert rejected.returncode == 1
+        assert '25-hour freshness limit' in rejected.stderr
         with TestClient(app) as client:
             preview = client.get('/api/account-deletion/preview', headers=deleted).json()
             started = client.post('/api/account-deletion', headers=deleted, json={
@@ -121,8 +146,19 @@ def test_restore_dump_and_replay_deletion(tmp_path, monkeypatch):
                 'confirmation': 'DELETE MY ACCOUNT',
             })
             assert started.status_code == 202, started.text
-        pg('pg_restore', target, '--exit-on-error', '--no-owner', archive)
-        assert list(restored_assets.rglob('*.pdf'))
+        restore_command = [
+            sys.executable, str(backup_script.with_name('restore_backup.py')), str(verified_archive),
+            '--database', target,
+            '--pg-restore', str(Path(tool_dir) / ('pg_restore.exe' if os.name == 'nt' else 'pg_restore')),
+        ]
+        subprocess.run([*restore_command, '--destination', str(recovery)],
+                       env=environment, check=True, timeout=60)
+        refused_destination = tmp_path / 'refused-recovery'
+        refused = subprocess.run([*restore_command, '--destination', str(refused_destination)],
+                                 env=environment, capture_output=True, text=True, timeout=60)
+        assert refused.returncode != 0 and 'must be an empty database' in refused.stderr
+        assert not refused_destination.exists()
+        assert len(list(restored_assets.rglob('*.pdf'))) == 2
         settings.database_url = dsn(target)
         settings.storage_path = str(restored_assets)
         with TestClient(app) as recovered:
@@ -133,9 +169,12 @@ def test_restore_dump_and_replay_deletion(tmp_path, monkeypatch):
             from app.account_deletion import deletion_once
             recovered.portal.call(deletion_once)
             deadline = time.monotonic() + 5
-            while list(restored_assets.rglob('*.pdf')) and time.monotonic() < deadline:
+            while len(list(restored_assets.rglob('*.pdf'))) > 1 and time.monotonic() < deadline:
                 time.sleep(.05)
-            assert not list(restored_assets.rglob('*.pdf'))
+            assert [path.read_bytes() for path in restored_assets.rglob('*.pdf')] == [retained_bytes]
+            readback = recovered.get(retained_file, headers=retained)
+            assert readback.status_code == 200, readback.text
+            assert readback.content == retained_bytes
 
             async def remaining_account():
                 from app.platform import db

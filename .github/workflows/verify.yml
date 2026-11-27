@@ -22,6 +22,7 @@ jobs:
       AUCTOR_TEST_PG_BIN: /usr/lib/postgresql/16/bin
     steps:
       - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'

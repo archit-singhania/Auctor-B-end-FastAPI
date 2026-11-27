@@ -23,7 +23,16 @@ python scripts/backup.py --writes-paused --storage /private/assets \
   --deletion-ledger /private/deletion-ledger --output /restricted/backups
 ```
 
-The command publishes an archive only after capturing the custom PostgreSQL dump, assets and a SHA-256 manifest. It prunes expired archives from the dedicated destination after a successful backup. Preserve the latest deletion ledger and signing keys separately. Before resuming service from a backup, verify the manifest and restore into an isolated database and asset root with the latest ledger. Resume writes only after verifying account and share revocations.
+The command captures the custom PostgreSQL dump, assets and a SHA-256 manifest, then reads back the staged archive to verify its contents before publication. If verification fails, the staged file is removed and retention does not run. Expired archives are pruned from the dedicated destination after successful publication. Preserve the latest deletion ledger and signing keys separately. Before resuming service from a backup, run `python scripts/verify_backup.py /restricted/backups/archive.zip` and restore into an isolated database and asset root with the latest ledger. Resume writes only after verifying account and share revocations.
+
+For an isolated rehearsal, create an empty local database named `auctor_restore_rehearsal` and choose a recovery directory that does not exist yet. With the PostgreSQL connection configured for loopback, run:
+
+```sh
+python scripts/restore_backup.py /restricted/backups/archive.zip \
+  --database auctor_restore_rehearsal --destination /restricted/rehearsal
+```
+
+The command checks every entry while extracting and restores the dump in one transaction. If extraction or restore fails, discard the recovery directory and use a fresh destination on retry. For the rehearsal API, configure `STORAGE_PATH` as the recovery directory's `assets` subdirectory and use the latest protected deletion ledger. Keep that API isolated until revocation and deletion replay checks pass.
 
 Workers recover interrupted jobs, serialize archive creation and deletion, and retain status/count receipts without deleted content. Migration backfills use a transaction-local internal write bypass; ordinary requests cannot write to disabled accounts. New uploads use account-scoped directories; tracked legacy asset references are included in cleanup. Unattributable pre-migration orphan files still require operator inventory.
 
@@ -38,3 +47,5 @@ To repeat, set `AUCTOR_TEST_LOCAL=1` and `AUCTOR_TEST_PG_BIN` to the directory c
 ## Recorded checks
 
 November 17: 30 backend regression checks and four production-configuration checks passed. All 51 existing Flutter tests and two new responsive deletion fixtures passed in separate runs. JavaScript release web build passed. Analyzer has two existing informational test-style findings; build retains known Wasm secure-storage incompatibility and Cupertino-font warnings. Six repositories showed no log, DLL, PAK, EXE or .gitignore changes.
+
+For scheduled destination checks, run `python scripts/verify_backup.py /restricted/backups --latest --max-age-hours 25` against the mounted backup directory. Choose an age limit consistent with the backup schedule. The command exits with an error for a missing, stale, or invalid newest archive, and reports its filename on success. Its age check uses the manifest creation time, so copying an old archive does not make it current.

@@ -14,6 +14,11 @@ import tempfile
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, ZipFile
 
+if __package__:
+    from .verify_backup import verify_archive
+else:
+    from verify_backup import verify_archive
+
 
 NAME = re.compile(r'auctor-backup-(\d{8}T\d{6}Z)-[a-f0-9]{32}\.zip')
 
@@ -76,6 +81,7 @@ def backup(output, storage, ledger, pg_dump, retention_days):
                 archive.writestr('manifest.json', json.dumps({
                     'format_version': 1, 'created_at': now.isoformat(), 'entries': entries,
                 }, indent=2))
+            verify_archive(staged)
             staged.replace(final)
     finally:
         staged.unlink(missing_ok=True)
